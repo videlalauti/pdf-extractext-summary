@@ -30,6 +30,7 @@ pytest tests/ -v
 - `MAX_SUMMARY_CHARS`: tope de caracteres del documento que se envían a Ollama (default `12000`).
   El contenido que lo excede se trunca y el prompt avisa que está truncado.
 - `LOG_LEVEL`: nivel de logging (default `INFO`).
+- `PORT`: puerto del contenedor; también se usa en el `HEALTHCHECK` (default `8000`).
 
 Ver `.env.example` para un ejemplo.
 
@@ -59,3 +60,16 @@ ports:
 | Prompt/contexto demasiado largo (400) | `422` indicando `MAX_SUMMARY_CHARS` |
 | Ollama caído o error interno (5xx) | `502` |
 | Timeout de Ollama | `504` |
+
+`/health` responde `200` solo si Ollama responde a `GET /api/tags` (timeout corto, ~3 s);
+si no, responde `503` con `"status": "unhealthy"`.
+
+## Diseño interno
+
+- `llm.py`: puerto `LlmClient` (Protocol) y adaptador `OllamaLlmClient`, que es el único lugar
+  que conoce la API de Ollama y traduce sus fallos a errores de dominio.
+- `app.py`: `SummaryService` (obtener documento → truncar al tope → resumir) y `Settings`.
+- `routes.py`: endpoints que resuelven las dependencias con `Depends`; los tests inyectan un
+  doble del puerto con `app.dependency_overrides`, sin monkeypatchear librerías.
+- `error_handlers.py`: traduce los errores de dominio a respuestas HTTP sin exponer internals.
+- `middleware.py`: request-id (`X-Request-ID`) y logging de acceso.

@@ -3,17 +3,14 @@
 import logging
 
 import httpx
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 from errors import (
     DocumentNotFoundError,
-    LlmModelNotFoundError,
-    LlmPromptRejectedError,
-    LlmTimeoutError,
-    LlmUnavailableError,
     PersistenceUnavailableError,
 )
+from llm import LlmClient
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +35,15 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def get_settings() -> Settings:
+    return settings
+
+
+class SummaryResponse(BaseModel):
+    summary: str
+    document_id: str
+
+
 def build_prompt(content: str, max_chars: int) -> str:
     """Acota el contenido al límite de contexto y lo aclara en el prompt."""
     if len(content) <= max_chars:
@@ -50,55 +56,41 @@ def build_prompt(content: str, max_chars: int) -> str:
     return TRUNCATED_SUMMARY_PROMPT.format(content=content[:max_chars], max_chars=max_chars)
 
 
-async def fetch_document(document_id: str) -> dict:
-    url = f"{settings.persistence_service_url}/documents/{document_id}"
-    try:
-        async with httpx.AsyncClient(timeout=settings.persistence_timeout_seconds) as client:
-            response = await client.get(url)
+class SummaryService:
+    """Orquesta la obtaining del documento, el recorte y la llamada al LLM."""
+
+    def __init__(
+        self,
+        document_client: httpx.AsyncClient,
+        persistence_url: str,
+        llm_client: LlmClient,
+        model: str,
+        max_summary_chars: int,
+    ) -> None:
+        self._document_client = document_client
+        self._persistence_url = persistence_url.rstrip("/")
+        self._llm_client = llm_client
+        self._model = model
+        self._max_summary_chars = max_summary_chars
+
+    async def summarize(self, document_id: str) -> SummaryResponse:
+        document = await self._fetch_document(document_id)
+        content = document.get("content") or ""
+        prompt = build_prompt(content, self._max_summary_chars)
+        summary = await self._llm_client.generate(self._model, prompt)
+        return SummaryResponse(summary=summary, document_id=document_id)
+
+    async def _fetch_document(self, document_id: str) -> dict:
+        url = f"{self._persistence_url}/documents/{document_id}"
+        try:
+            response = await self._document_client.get(url)
             response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 404:
-            raise DocumentNotFoundError from exc
-        logger.warning("persistence-service respondió %s", exc.response.status_code)
-        raise PersistenceUnavailableError from exc
-    except httpx.RequestError as exc:
-        logger.warning("no se pudo conectar con persistence-service: %s", type(exc).__name__)
-        raise PersistenceUnavailableError from exc
-
-
-async def call_ollama(text: str) -> str:
-    payload = {
-        "model": settings.ollama_model,
-        "prompt": build_prompt(text, settings.max_summary_chars),
-        "stream": False,
-        "options": {"num_predict": 300},
-    }
-    try:
-        async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-            response = await client.post(f"{settings.ollama_url}/api/generate", json=payload)
-            response.raise_for_status()
-            return response.json().get("response", "")
-    except httpx.TimeoutException as exc:
-        logger.warning("timeout de Ollama generando con el modelo %s", settings.ollama_model)
-        raise LlmTimeoutError from exc
-    except httpx.HTTPStatusError as exc:
-        raise _translate_ollama_status(exc.response.status_code, settings.ollama_model) from exc
-    except httpx.RequestError as exc:
-        logger.warning("no se pudo conectar con Ollama: %s", type(exc).__name__)
-        raise LlmUnavailableError from exc
-
-
-def _translate_ollama_status(status_code: int, model: str) -> Exception:
-    if status_code == 404:
-        return LlmModelNotFoundError(model)
-    if status_code in (400, 422):
-        return LlmPromptRejectedError
-    logger.warning("Ollama respondió %s para el modelo %s", status_code, model)
-    return LlmUnavailableError
-
-
-async def summarize_document(document_id: str) -> dict:
-    document = await fetch_document(document_id)
-    summary = await call_ollama(document.get("content") or "")
-    return {"summary": summary, "document_id": document_id}
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise DocumentNotFoundError from exc
+            logger.warning("persistence-service respondió %s", exc.response.status_code)
+            raise PersistenceUnavailableError from exc
+        except httpx.RequestError as exc:
+            logger.warning("no se pudo conectar con persistence-service: %s", type(exc).__name__)
+            raise PersistenceUnavailableError from exc
+        return response.json()
