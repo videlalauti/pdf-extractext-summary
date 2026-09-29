@@ -6,13 +6,15 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from shared.web.cors import add_cors
+from shared.web.logging import RequestIdMiddleware, setup_logging
 
 from app import settings
 from error_handlers import register_error_handlers
 from llm import OllamaLlmClient
-from middleware import RequestIdLoggingMiddleware
 from routes import router
+
+SERVICE_NAME = "summary-service"
 
 
 def create_app() -> FastAPI:
@@ -30,23 +32,13 @@ def create_app() -> FastAPI:
             await llm_client.aclose()
             await document_client.aclose()
 
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
     application = FastAPI(title="PDF Summary Service", version="1.0.0", lifespan=lifespan)
-    application.add_middleware(RequestIdLoggingMiddleware)
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["X-Request-ID"],
-    )
+    application.add_middleware(RequestIdMiddleware)
+    add_cors(application)
     register_error_handlers(application)
     application.include_router(router)
     return application
 
 
+setup_logging(SERVICE_NAME, level=getattr(logging, settings.log_level.upper(), logging.INFO))
 app = create_app()

@@ -30,6 +30,8 @@ pytest tests/ -v
 - `MAX_SUMMARY_CHARS`: tope de caracteres del documento que se envían a Ollama (default `12000`).
   El contenido que lo excede se trunca y el prompt avisa que está truncado.
 - `LOG_LEVEL`: nivel de logging (default `INFO`).
+- `CORS_ORIGINS`: orígenes permitidos en CSV (default `http://localhost`). `*` está
+  rechazado porque el middleware habilita credenciales.
 - `PORT`: puerto del contenedor; también se usa en el `HEALTHCHECK` (default `8000`).
 
 Ver `.env.example` para un ejemplo.
@@ -44,6 +46,7 @@ environment:
   OLLAMA_URL: http://ollama:11434
   OLLAMA_MODEL: llama3.2
   MAX_SUMMARY_CHARS: "12000"
+  CORS_ORIGINS: http://localhost
 ports:
   - "8004:8000"
 ```
@@ -72,4 +75,12 @@ si no, responde `503` con `"status": "unhealthy"`.
 - `routes.py`: endpoints que resuelven las dependencias con `Depends`; los tests inyectan un
   doble del puerto con `app.dependency_overrides`, sin monkeypatchear librerías.
 - `error_handlers.py`: traduce los errores de dominio a respuestas HTTP sin exponer internals.
-- `middleware.py`: request-id (`X-Request-ID`) y logging de acceso.
+- `main.py`: logging con request-id y CORS salen de `pdf-extractext-shared`
+  (`shared.web.logging.setup_logging` + `RequestIdMiddleware` y `shared.web.cors.add_cors`),
+  igual que en los otros servicios del proyecto.
+
+El paquete `pdf-extractext-shared` se instala desde el tag, no desde PyPI:
+
+```
+pip install "pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.0.0.zip"
+```

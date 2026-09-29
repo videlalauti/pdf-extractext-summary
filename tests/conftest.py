@@ -30,6 +30,7 @@ def build_client() -> Iterator[Callable[..., TestClient]]:
         content: str = DEFAULT_CONTENT,
         status_code: int = 200,
         connect_error: bool = False,
+        raise_server_exceptions: bool = True,
     ) -> TestClient:
         fake_llm = llm_client if llm_client is not None else FakeLlmClient()
         persistence = document_client(
@@ -37,7 +38,7 @@ def build_client() -> Iterator[Callable[..., TestClient]]:
         )
         app.dependency_overrides[get_llm_client] = lambda: fake_llm
         app.dependency_overrides[get_document_client] = lambda: persistence
-        return TestClient(app)
+        return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
     try:
         yield build

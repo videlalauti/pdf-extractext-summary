@@ -12,7 +12,6 @@ from errors import (
 )
 from llm import LlmClient
 from main import app
-from middleware import REQUEST_ID_HEADER
 
 
 def test_health_healthy_cuando_ollama_responde(build_client):
@@ -33,13 +32,6 @@ def test_health_unhealthy_cuando_ollama_no_responde(build_client):
 
     assert response.status_code == 503
     assert response.json()["status"] == "unhealthy"
-
-
-def test_health_devuelve_request_id(build_client):
-    with build_client() as client:
-        response = client.get("/health")
-
-    assert response.headers[REQUEST_ID_HEADER]
 
 
 def test_summary_devuelve_resumen_y_documento(build_client, llm):
@@ -157,3 +149,13 @@ def test_summary_no_expone_internals_de_httpx(build_client, llm, error):
 
     assert "httpx" not in response.json()["detail"]
     assert "Traceback" not in response.json()["detail"]
+
+
+def test_summary_error_inesperado_devuelve_500_sin_internals(build_client, llm):
+    llm.error = RuntimeError("se rompio algo interno")
+
+    with build_client(llm_client=llm, raise_server_exceptions=False) as client:
+        response = client.post("/summary/doc-1")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Error interno"}

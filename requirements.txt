@@ -2,3 +2,4 @@ fastapi==0.141.1
 uvicorn[standard]==0.53.0
 httpx==0.28.1
 pydantic-settings==2.15.0
+pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.0.0.zip
