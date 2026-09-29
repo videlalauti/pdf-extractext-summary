@@ -1,6 +1,6 @@
 """Summary service: endpoints HTTP para resumir documentos con Ollama."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app import summarize_document
@@ -15,9 +15,4 @@ class SummaryResponse(BaseModel):
 
 @router.post("/summary/{document_id}", response_model=SummaryResponse)
 async def get_summary(document_id: str) -> SummaryResponse:
-    try:
-        return await summarize_document(document_id)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {e!s}") from e
+    return SummaryResponse(**await summarize_document(document_id))

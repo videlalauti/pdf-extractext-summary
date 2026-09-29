@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt requirements.lock.txt ./
 RUN pip install --no-cache-dir -r requirements.lock.txt
 
-COPY main.py app.py routes.py .
+COPY main.py app.py routes.py errors.py error_handlers.py ./
 
 EXPOSE 8000
 
