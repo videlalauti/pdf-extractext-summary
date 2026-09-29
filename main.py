@@ -2,8 +2,8 @@
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes import router
 
+from routes import router
 
 app = FastAPI(title="PDF Summary Service", version="1.0.0")
 

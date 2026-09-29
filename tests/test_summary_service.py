@@ -1,8 +1,10 @@
-import httpx
-from app import settings
-from fastapi.testclient import TestClient
-from main import app
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+from fastapi.testclient import TestClient
+
+from app import settings
+from main import app
 
 client = TestClient(app)
 
@@ -23,18 +25,17 @@ def test_summary_returns_summary():
                 raise_for_status=lambda: None,
             )
         ),
+    ), patch(
+        "httpx.AsyncClient.post",
+        new=AsyncMock(
+            return_value=MagicMock(
+                status_code=200,
+                json=lambda: {"response": "resumen de prueba"},
+                raise_for_status=lambda: None,
+            )
+        ),
     ):
-        with patch(
-            "httpx.AsyncClient.post",
-            new=AsyncMock(
-                return_value=MagicMock(
-                    status_code=200,
-                    json=lambda: {"response": "resumen de prueba"},
-                    raise_for_status=lambda: None,
-                )
-            ),
-        ):
-            response = client.post("/summary/doc-1")
+        response = client.post("/summary/doc-1")
 
     assert response.status_code == 200
     assert response.json()["summary"] == "resumen de prueba"
@@ -83,9 +84,8 @@ def test_summary_sends_correct_payload_to_ollama():
                 raise_for_status=lambda: None,
             )
         ),
-    ):
-        with patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=mock_post)):
-            response = client.post("/summary/doc-1")
+    ), patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=mock_post)):
+        response = client.post("/summary/doc-1")
 
     assert response.status_code == 200
     assert captured_payload["url"] == f"{settings.ollama_url}/api/generate"

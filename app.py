@@ -23,11 +23,11 @@ async def fetch_document(document_id: str) -> dict:
             return response.json()
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
-        detail = "Document not found" if status == 404 else f"Error en persistence-service: {str(e)}"
+        detail = "Document not found" if status == 404 else f"Error en persistence-service: {e!s}"
         raise HTTPException(status_code=status, detail=detail) from e
     except httpx.RequestError as e:
         raise HTTPException(
-            status_code=502, detail=f"Error comunicándose con persistence-service: {str(e)}"
+            status_code=502, detail=f"Error comunicándose con persistence-service: {e!s}"
         ) from e
 
 
@@ -46,7 +46,7 @@ async def call_ollama(text: str) -> str:
             return response.json().get("response", "")
     except (httpx.RequestError, httpx.HTTPStatusError) as e:
         raise HTTPException(
-            status_code=504, detail=f"Error comunicándose con Ollama: {str(e)}"
+            status_code=504, detail=f"Error comunicándose con Ollama: {e!s}"
         ) from e
 
 

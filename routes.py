@@ -20,4 +20,4 @@ async def get_summary(document_id: str) -> SummaryResponse:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}") from e
+        raise HTTPException(status_code=500, detail=f"Error interno: {e!s}") from e
