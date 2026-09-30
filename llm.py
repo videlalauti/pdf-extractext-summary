@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 PROMPT_REJECTED_STATUSES = frozenset({400, 422})
 HEALTH_CHECK_TIMEOUT_SECONDS = 3.0
+MAX_PREDICT_TOKENS = 200
 
 
 @runtime_checkable
@@ -51,7 +52,7 @@ class OllamaLlmClient:
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "options": {"num_predict": 300},
+            "options": {"num_predict": MAX_PREDICT_TOKENS},
         }
         try:
             response = await self._client.post(f"{self._base_url}/api/generate", json=payload)

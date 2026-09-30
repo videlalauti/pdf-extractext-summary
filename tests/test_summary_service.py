@@ -2,6 +2,7 @@
 
 import pytest
 from fakes import FakeLlmClient
+from pydantic import ValidationError
 
 from app import Settings, get_settings, settings
 from errors import (
@@ -47,8 +48,9 @@ def test_fake_del_puerto_cumple_el_protocolo():
     assert isinstance(FakeLlmClient(), LlmClient)
 
 
-def test_summary_trunca_el_contenido_al_tope_de_contexto(build_client, llm):
+def test_summary_recorta_el_contenido_a_inicio_mas_final(build_client, llm):
     content = "#" * (settings.max_summary_chars + 5000)
+    half = settings.max_summary_chars // 2
 
     with build_client(llm_client=llm, content=content) as client:
         response = client.post("/summary/doc-1")
@@ -56,8 +58,19 @@ def test_summary_trunca_el_contenido_al_tope_de_contexto(build_client, llm):
     assert response.status_code == 200
     prompt = llm.prompts[0]
     assert prompt.count("#") == settings.max_summary_chars
-    assert prompt.endswith(content[: settings.max_summary_chars])
-    assert "truncado" in prompt
+    assert prompt.endswith(content[-half:])
+    assert content[:half] in prompt
+    assert "recortado" in prompt
+
+
+def test_summary_avisa_que_falta_la_parte_del_medio(build_client, llm):
+    content = "#" * (settings.max_summary_chars + 5000)
+
+    with build_client(llm_client=llm, content=content) as client:
+        response = client.post("/summary/doc-1")
+
+    assert response.status_code == 200
+    assert "omitido" in llm.prompts[0]
 
 
 def test_summary_no_trunca_un_contenido_corto(build_client, llm):
@@ -67,20 +80,30 @@ def test_summary_no_trunca_un_contenido_corto(build_client, llm):
     assert response.status_code == 200
     prompt = llm.prompts[0]
     assert prompt.endswith("texto corto")
-    assert "truncado" not in prompt
+    assert "recortado" not in prompt
 
 
 def test_summary_respeta_el_tope_configurado(build_client, llm):
     app.dependency_overrides[get_settings] = lambda: Settings(max_summary_chars=20)
+    content = "a" * 50 + "b" * 50
     try:
-        with build_client(llm_client=llm, content="y" * 100) as client:
+        with build_client(llm_client=llm, content=content) as client:
             response = client.post("/summary/doc-1")
     finally:
         app.dependency_overrides.pop(get_settings, None)
 
     assert response.status_code == 200
-    assert llm.prompts[0].count("y") == 20
-    assert "20 caracteres" in llm.prompts[0]
+    prompt = llm.prompts[0]
+    assert content[:10] in prompt
+    assert content[-10:] in prompt
+    assert "a" * 11 not in prompt
+    assert "b" * 11 not in prompt
+    assert "20 caracteres" in prompt
+
+
+def test_el_tope_de_contexto_tiene_que_permitir_mitad_y_mitad():
+    with pytest.raises(ValidationError):
+        Settings(max_summary_chars=1)
 
 
 def test_summary_documento_no_encontrado(build_client):

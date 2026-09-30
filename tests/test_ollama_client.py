@@ -75,7 +75,7 @@ async def test_generate_envia_el_payload_esperado():
         "model": "llama3.2",
         "prompt": PROMPT,
         "stream": False,
-        "options": {"num_predict": 300},
+        "options": {"num_predict": 200},
     }
 
 

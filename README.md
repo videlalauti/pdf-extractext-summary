@@ -27,8 +27,10 @@ pytest tests/ -v
 - `OLLAMA_URL`: URL base de Ollama (ej: `http://ollama:11434`).
 - `OLLAMA_MODEL`: modelo usado para resumir (default `llama3.2`).
 - `OLLAMA_TIMEOUT_SECONDS`: timeout de la generación (default `300`).
-- `MAX_SUMMARY_CHARS`: tope de caracteres del documento que se envían a Ollama (default `12000`).
-  El contenido que lo excede se trunca y el prompt avisa que está truncado.
+- `MAX_SUMMARY_CHARS`: tope de caracteres del documento que se envían a Ollama (default `3000`,
+  ≈ 1000 tokens). El contenido que lo excede se recorta a inicio + final (mitad y mitad) y el
+  prompt avisa que fue recortado y que falta la parte del medio. El default es chico a propósito:
+  el costo dominante en CPU es el prefill del prompt, no la generación.
 - `LOG_LEVEL`: nivel de logging (default `INFO`).
 - `CORS_ORIGINS`: orígenes permitidos en CSV (default `http://localhost`). `*` está
   rechazado porque el middleware habilita credenciales.
@@ -45,7 +47,7 @@ environment:
   PERSISTENCE_SERVICE_URL: http://persistence-service:8000
   OLLAMA_URL: http://ollama:11434
   OLLAMA_MODEL: llama3.2
-  MAX_SUMMARY_CHARS: "12000"
+  MAX_SUMMARY_CHARS: "3000"
   CORS_ORIGINS: http://localhost
 ports:
   - "8004:8000"
@@ -71,7 +73,7 @@ si no, responde `503` con `"status": "unhealthy"`.
 
 - `llm.py`: puerto `LlmClient` (Protocol) y adaptador `OllamaLlmClient`, que es el único lugar
   que conoce la API de Ollama y traduce sus fallos a errores de dominio.
-- `app.py`: `SummaryService` (obtener documento → truncar al tope → resumir) y `Settings`.
+- `app.py`: `SummaryService` (obtener documento → recortar a inicio + final → resumir) y `Settings`.
 - `routes.py`: endpoints que resuelven las dependencias con `Depends`; los tests inyectan un
   doble del puerto con `app.dependency_overrides`, sin monkeypatchear librerías.
 - `error_handlers.py`: traduce los errores de dominio a respuestas HTTP sin exponer internals.

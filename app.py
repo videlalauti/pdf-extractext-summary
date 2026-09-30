@@ -15,11 +15,12 @@ from llm import LlmClient
 logger = logging.getLogger(__name__)
 
 SUMMARY_PROMPT = "Resumí en español el siguiente texto:\n\n{content}"
-TRUNCATED_SUMMARY_PROMPT = (
-    "Resumí en español el siguiente texto. Ojo: el contenido fue truncado a los primeros "
-    "{max_chars} caracteres porque el documento excede el límite de contexto del modelo.\n\n"
-    "{content}"
+HEAD_TAIL_SUMMARY_PROMPT = (
+    "Resumí en español el siguiente texto. Ojo: el contenido fue recortado porque el documento "
+    "excede el límite de contexto del modelo: llegan los primeros {half} caracteres y los últimos "
+    "{half} caracteres de un total de {max_chars} caracteres.\n\n{content}"
 )
+OMITTED_CONTENT_MARKER = "[contenido intermedio omitido]"
 
 
 class Settings(BaseSettings):
@@ -28,7 +29,8 @@ class Settings(BaseSettings):
     ollama_url: str = "http://ollama:11434"
     ollama_model: str = "llama3.2"
     ollama_timeout_seconds: float = 300.0
-    max_summary_chars: int = Field(default=12000, gt=0)
+    # gt=1 porque el recorte es mitad y mitad: con 1, content[-0:] devolvería el documento entero.
+    max_summary_chars: int = Field(default=3000, gt=1)
     log_level: str = "INFO"
 
 
@@ -45,15 +47,27 @@ class SummaryResponse(BaseModel):
 
 
 def build_prompt(content: str, max_chars: int) -> str:
-    """Acota el contenido al límite de contexto y lo aclara en el prompt."""
+    """Acota el contenido al límite de contexto con inicio + final y lo aclara en el prompt.
+
+    En CPU el costo dominante es el prefill del prompt, así que si el documento excede el
+    presupuesto se conserva la cabeza y la cola (donde está la conclusión) en vez de solo
+    los primeros caracteres.
+    """
     if len(content) <= max_chars:
         return SUMMARY_PROMPT.format(content=content)
+    half = max_chars // 2
     logger.info(
-        "contenido de %d caracteres truncado a %d para no exceder la ventana de contexto",
+        "contenido de %d caracteres recortado a inicio (%d) + final (%d) para no exceder "
+        "la ventana de contexto",
         len(content),
-        max_chars,
+        half,
+        half,
     )
-    return TRUNCATED_SUMMARY_PROMPT.format(content=content[:max_chars], max_chars=max_chars)
+    return HEAD_TAIL_SUMMARY_PROMPT.format(
+        content=f"{content[:half]}\n\n{OMITTED_CONTENT_MARKER}\n\n{content[-half:]}",
+        half=half,
+        max_chars=max_chars,
+    )
 
 
 class SummaryService:
