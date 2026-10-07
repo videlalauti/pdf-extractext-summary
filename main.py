@@ -10,6 +10,7 @@ from shared.web.cors import add_cors
 from shared.web.logging import RequestIdMiddleware, setup_logging
 
 from app import settings
+from cache import RedisSummaryCache
 from error_handlers import register_error_handlers
 from llm import OllamaLlmClient
 from routes import router
@@ -24,11 +25,18 @@ def create_app() -> FastAPI:
         llm_client = OllamaLlmClient(
             base_url=settings.ollama_url, timeout=settings.ollama_timeout_seconds
         )
+        summary_cache = RedisSummaryCache(
+            settings.redis_url,
+            ttl_seconds=settings.summary_cache_ttl_seconds,
+            enabled=settings.summary_cache_enabled,
+        )
         application.state.document_client = document_client
         application.state.llm_client = llm_client
+        application.state.summary_cache = summary_cache
         try:
             yield
         finally:
+            await summary_cache.aclose()
             await llm_client.aclose()
             await document_client.aclose()
 

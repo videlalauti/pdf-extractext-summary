@@ -31,12 +31,30 @@ pytest tests/ -v
   ≈ 800 tokens). El contenido que lo excede se recorta a inicio + final (mitad y mitad) y el
   prompt avisa que fue recortado y que falta la parte del medio. El default es chico a propósito:
   el costo dominante en CPU es el prefill del prompt, no la generación.
+- `REDIS_URL`: URL de Redis que guarda el estado/resultado del resumen (default `redis://redis:6379/0`).
+- `SUMMARY_CACHE_TTL_SECONDS`: TTL de la clave de cada resumen en Redis (default `3600`);
+  pasado ese tiempo hay que volver a resumir.
+- `SUMMARY_CACHE_ENABLED`: si es `false`, el servicio degrada a resumen síncrono siempre.
 - `LOG_LEVEL`: nivel de logging (default `INFO`).
 - `CORS_ORIGINS`: orígenes permitidos en CSV (default `http://localhost`). `*` está
   rechazado porque el middleware habilita credenciales.
 - `PORT`: puerto del contenedor; también se usa en el `HEALTHCHECK` (default `8000`).
 
 Ver `.env.example` para un ejemplo.
+
+## Resumen asíncrono
+
+`POST /summary/{document_id}` y `GET /summary/{document_id}` comparten la misma clave en Redis
+(`summary:{document_id}`, con TTL) como estado y caché del resumen:
+
+- **Miss**: `POST` responde `202 {"status": "queued"}` y el resumen corre en background
+  (tarea asyncio en proceso, sin colas externas). Si viene un segundo `POST` mientras corre,
+  responde `202` con el estado actual sin duplicar el job; si el resumen ya terminó, responde
+  `200` al instante sin volver a inferir.
+- **`GET`** devuelve `200 {summary, document_id}` si terminó, `202 {"status": "processing"}` si
+  está corriendo, y `404` si nunca se pidió.
+- **Fail-open**: si Redis no responde, `POST` degrada al flujo síncrono de siempre y responde
+  `200`; la caché nunca provoca un 5xx.
 
 ## Integración en el compose
 
@@ -48,6 +66,8 @@ environment:
   OLLAMA_URL: http://ollama:11434
   OLLAMA_MODEL: llama3.2
   MAX_SUMMARY_CHARS: "2400"
+  REDIS_URL: redis://redis:6379/0
+  SUMMARY_CACHE_TTL_SECONDS: "3600"
   CORS_ORIGINS: http://localhost
 ports:
   - "8004:8000"
@@ -73,7 +93,10 @@ si no, responde `503` con `"status": "unhealthy"`.
 
 - `llm.py`: puerto `LlmClient` (Protocol) y adaptador `OllamaLlmClient`, que es el único lugar
   que conoce la API de Ollama y traduce sus fallos a errores de dominio.
-- `app.py`: `SummaryService` (obtener documento → recortar a inicio + final → resumir) y `Settings`.
+- `cache.py`: puerto `SummaryCache` (Protocol, `get`/`set`), `NoopSummaryCache` (flujo síncrono)
+  y `RedisSummaryCache` (clave única con TTL y fail-open); mismo patrón que `llm.py`.
+- `app.py`: `SummaryService` (obtener documento → recortar a inicio + final → resumir), el
+  estado del job y `Settings`.
 - `routes.py`: endpoints que resuelven las dependencias con `Depends`; los tests inyectan un
   doble del puerto con `app.dependency_overrides`, sin monkeypatchear librerías.
 - `error_handlers.py`: traduce los errores de dominio a respuestas HTTP sin exponer internals.

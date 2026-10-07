@@ -1,5 +1,7 @@
 """Doubles usados por los tests: implementan los puertos sin tocar librerías."""
 
+import asyncio
+
 import httpx
 
 DEFAULT_CONTENT = "texto de prueba"
@@ -14,10 +16,12 @@ class FakeLlmClient:
         *,
         available: bool = True,
         error: Exception | None = None,
+        delay: float | None = None,
     ) -> None:
         self.summary = summary
         self.available = available
         self.error = error
+        self.delay = delay
         self.prompts: list[str] = []
         self.models: list[str] = []
 
@@ -26,10 +30,37 @@ class FakeLlmClient:
         self.models.append(model)
         if self.error is not None:
             raise self.error
+        if self.delay is not None:
+            await asyncio.sleep(self.delay)
         return self.summary
 
     async def is_available(self) -> bool:
         return self.available
+
+
+class FakeSummaryCache:
+    """Implementación en memoria de :class:`SummaryCache` que registra escrituras.
+
+    Con `fail_open=True` simula a Redis caído: `get` es miss y `set` devuelve
+    False para que el flujo degrade a síncrono.
+    """
+
+    def __init__(self, *, fail_open: bool = False) -> None:
+        self.fail_open = fail_open
+        self.data: dict[str, str] = {}
+        self.sets: list[tuple[str, str]] = []
+
+    async def get(self, key: str) -> str | None:
+        if self.fail_open:
+            return None
+        return self.data.get(key)
+
+    async def set(self, key: str, value: str) -> bool:
+        if self.fail_open:
+            return False
+        self.sets.append((key, value))
+        self.data[key] = value
+        return True
 
 
 def document_client(

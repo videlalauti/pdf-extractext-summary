@@ -1,11 +1,13 @@
 """Summary service: capa de aplicación, orquestación con persistence y Ollama."""
 
+import json
 import logging
 
 import httpx
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from cache import NoopSummaryCache, SummaryCache
 from errors import (
     DocumentNotFoundError,
     PersistenceUnavailableError,
@@ -13,6 +15,10 @@ from errors import (
 from llm import LlmClient
 
 logger = logging.getLogger(__name__)
+
+JOB_STATE_QUEUED = "queued"
+JOB_STATE_PROCESSING = "processing"
+JOB_STATE_DONE = "done"
 
 SUMMARY_PROMPT = "Resumí en español el siguiente texto:\n\n{content}"
 HEAD_TAIL_SUMMARY_PROMPT = (
@@ -31,6 +37,9 @@ class Settings(BaseSettings):
     ollama_timeout_seconds: float = 300.0
     # gt=1 porque el recorte es mitad y mitad: con 1, content[-0:] devolvería el documento entero.
     max_summary_chars: int = Field(default=2400, gt=1)
+    redis_url: str = "redis://redis:6379/0"
+    summary_cache_ttl_seconds: int = Field(default=3600, gt=0)
+    summary_cache_enabled: bool = True
     log_level: str = "INFO"
 
 
@@ -44,6 +53,35 @@ def get_settings() -> Settings:
 class SummaryResponse(BaseModel):
     summary: str
     document_id: str
+
+
+class SummaryJob(BaseModel):
+    """Estado y resultado del resumen, guardado como JSON en una sola clave Redis."""
+
+    status: str
+    summary: str | None = None
+
+
+def build_summary_key(document_id: str) -> str:
+    return f"summary:{document_id}"
+
+
+def serialize_job(status: str, *, summary: str | None = None) -> str:
+    job = {"status": status}
+    if summary is not None:
+        job["summary"] = summary
+    return json.dumps(job)
+
+
+def parse_job(raw: str | None) -> SummaryJob | None:
+    """Interpreta lo guardado en la caché; un valor corrupto se trata como miss."""
+    if raw is None:
+        return None
+    try:
+        return SummaryJob.model_validate_json(raw)
+    except ValueError:
+        logger.warning("valor de caché inválido para un resumen; se trata como miss")
+        return None
 
 
 def build_prompt(content: str, max_chars: int) -> str:
@@ -71,7 +109,12 @@ def build_prompt(content: str, max_chars: int) -> str:
 
 
 class SummaryService:
-    """Orquesta la obtaining del documento, el recorte y la llamada al LLM."""
+    """Orquesta la obtención del documento, el recorte y la llamada al LLM.
+
+    Cuando la caché aplica (Redis), el resumen corre en background con estado
+    guardado en la caché; sin caché (Noop o Redis caído) mantiene el flujo
+    síncrono de siempre.
+    """
 
     def __init__(
         self,
@@ -80,19 +123,52 @@ class SummaryService:
         llm_client: LlmClient,
         model: str,
         max_summary_chars: int,
+        cache: SummaryCache | None = None,
     ) -> None:
         self._document_client = document_client
         self._persistence_url = persistence_url.rstrip("/")
         self._llm_client = llm_client
         self._model = model
         self._max_summary_chars = max_summary_chars
+        self._cache = cache if cache is not None else NoopSummaryCache()
 
     async def summarize(self, document_id: str) -> SummaryResponse:
+        """Resumen síncrono: el flujo original, usado cuando la caché degrada."""
+        summary = await self._generate_summary(document_id)
+        return SummaryResponse(summary=summary, document_id=document_id)
+
+    async def peek_job(self, document_id: str) -> SummaryJob | None:
+        """Devuelve el job guardado en la caché (estado + resultado) o None si es miss."""
+        return parse_job(await self._cache.get(build_summary_key(document_id)))
+
+    async def enqueue(self, document_id: str) -> bool:
+        """Marca el job como encolado. False = no se pudo guardar y hay que degradar."""
+        return await self._cache.set(
+            build_summary_key(document_id), serialize_job(JOB_STATE_QUEUED)
+        )
+
+    async def process(self, document_id: str) -> None:
+        """Corre el job en background: processing → resumen → done + resultado.
+
+        Si el resumen falla se loguea y el estado queda en processing hasta que
+        expire el TTL; no hay estado intermedio de error (KISS).
+        """
+        key = build_summary_key(document_id)
+        await self._cache.set(key, serialize_job(JOB_STATE_PROCESSING))
+        try:
+            summary = await self._generate_summary(document_id)
+        except Exception:
+            logger.exception(
+                "el job de %s falló; el TTL de la caché limpiará el estado", document_id
+            )
+            return
+        await self._cache.set(key, serialize_job(JOB_STATE_DONE, summary=summary))
+
+    async def _generate_summary(self, document_id: str) -> str:
         document = await self._fetch_document(document_id)
         content = document.get("content") or ""
         prompt = build_prompt(content, self._max_summary_chars)
-        summary = await self._llm_client.generate(self._model, prompt)
-        return SummaryResponse(summary=summary, document_id=document_id)
+        return await self._llm_client.generate(self._model, prompt)
 
     async def _fetch_document(self, document_id: str) -> dict:
         url = f"{self._persistence_url}/documents/{document_id}"
