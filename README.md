@@ -27,8 +27,8 @@ pytest tests/ -v
 - `OLLAMA_URL`: URL base de Ollama (ej: `http://ollama:11434`).
 - `OLLAMA_MODEL`: modelo usado para resumir (default `llama3.2`).
 - `OLLAMA_TIMEOUT_SECONDS`: timeout de la generación (default `300`).
-- `MAX_SUMMARY_CHARS`: tope de caracteres del documento que se envían a Ollama (default `3000`,
-  ≈ 1000 tokens). El contenido que lo excede se recorta a inicio + final (mitad y mitad) y el
+- `MAX_SUMMARY_CHARS`: tope de caracteres del documento que se envían a Ollama (default `2400`,
+  ≈ 800 tokens). El contenido que lo excede se recorta a inicio + final (mitad y mitad) y el
   prompt avisa que fue recortado y que falta la parte del medio. El default es chico a propósito:
   el costo dominante en CPU es el prefill del prompt, no la generación.
 - `LOG_LEVEL`: nivel de logging (default `INFO`).
@@ -47,7 +47,7 @@ environment:
   PERSISTENCE_SERVICE_URL: http://persistence-service:8000
   OLLAMA_URL: http://ollama:11434
   OLLAMA_MODEL: llama3.2
-  MAX_SUMMARY_CHARS: "3000"
+  MAX_SUMMARY_CHARS: "2400"
   CORS_ORIGINS: http://localhost
 ports:
   - "8004:8000"

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3.2"
     ollama_timeout_seconds: float = 300.0
     # gt=1 porque el recorte es mitad y mitad: con 1, content[-0:] devolvería el documento entero.
-    max_summary_chars: int = Field(default=3000, gt=1)
+    max_summary_chars: int = Field(default=2400, gt=1)
     log_level: str = "INFO"
 
 
