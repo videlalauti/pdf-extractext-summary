@@ -1,7 +1,5 @@
 """Summary service: endpoints HTTP para resumir documentos con Ollama."""
 
-import asyncio
-
 import httpx
 from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
@@ -12,6 +10,7 @@ from app import (
     Settings,
     SummaryResponse,
     SummaryService,
+    build_summary_service,
     get_settings,
 )
 from cache import SummaryCache
@@ -19,9 +18,6 @@ from errors import DocumentNotFoundError
 from llm import LlmClient
 
 router = APIRouter()
-
-# Referencias vivas a los jobs en background: sin ellas, asyncio los descartaría.
-_pending_tasks: set[asyncio.Task] = set()
 
 
 def get_llm_client(request: Request) -> LlmClient:
@@ -42,27 +38,22 @@ def get_summary_service(
     cache: SummaryCache = Depends(get_summary_cache),
     config: Settings = Depends(get_settings),
 ) -> SummaryService:
-    return SummaryService(
-        document_client=document_client,
-        persistence_url=config.persistence_service_url,
-        llm_client=llm_client,
-        model=config.ollama_model,
-        max_summary_chars=config.max_summary_chars,
-        cache=cache,
+    return build_summary_service(
+        document_client=document_client, llm_client=llm_client, cache=cache, config=config
     )
-
-
-def _launch(job_task: asyncio.Task) -> None:
-    """Mantiene viva la tarea de background y la descarta al terminar."""
-    _pending_tasks.add(job_task)
-    job_task.add_done_callback(_pending_tasks.discard)
 
 
 @router.post("/summary/{document_id}", response_model=None)
 async def submit_summary(
     document_id: str, service: SummaryService = Depends(get_summary_service)
 ) -> SummaryResponse | JSONResponse:
-    """Devuelve el resumen si ya está cacheado, o lo encola en background (202)."""
+    """Devuelve el resumen si ya existe; si no, acepta el trabajo con 202.
+
+    El trabajo lo dispara el consumer de Kafka con el evento
+    `documents.extracted`; el POST solo marca `queued` en la caché
+    (best-effort) para que GET responda 202 y no 404 mientras el consumer lo
+    toma.
+    """
     job = await service.peek_job(document_id)
     if job is not None and job.status == JOB_STATE_DONE:
         return SummaryResponse(summary=job.summary or "", document_id=document_id)
@@ -70,12 +61,10 @@ async def submit_summary(
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED, content={"status": job.status}
         )
-    if await service.enqueue(document_id):
-        _launch(asyncio.create_task(service.process(document_id)))
-        return JSONResponse(
-            status_code=status.HTTP_202_ACCEPTED, content={"status": JOB_STATE_QUEUED}
-        )
-    return await service.summarize(document_id)
+    await service.enqueue(document_id)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED, content={"status": JOB_STATE_QUEUED}
+    )
 
 
 @router.get("/summary/{document_id}", response_model=None)

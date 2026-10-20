@@ -63,6 +63,33 @@ class FakeSummaryCache:
         return True
 
 
+class FakeKafkaConsumer:
+    """Doble de AIOKafkaConsumer: registra commits y simula fallos de arranque."""
+
+    def __init__(self, messages=(), *, start_error: Exception | None = None) -> None:
+        self.messages = list(messages)
+        self.start_error = start_error
+        self.commits = 0
+        self.stopped = False
+
+    async def start(self) -> None:
+        if self.start_error is not None:
+            raise self.start_error
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+    def __aiter__(self):
+        return self._stream()
+
+    async def _stream(self):
+        for message in self.messages:
+            yield message
+
+
 def document_client(
     content: str = DEFAULT_CONTENT,
     *,

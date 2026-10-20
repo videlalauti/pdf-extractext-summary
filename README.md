@@ -45,16 +45,21 @@ Ver `.env.example` para un ejemplo.
 ## Resumen asíncrono
 
 `POST /summary/{document_id}` y `GET /summary/{document_id}` comparten la misma clave en Redis
-(`summary:{document_id}`, con TTL) como estado y caché del resumen:
+(`summary:{document_id}`, con TTL) como estado y caché del resumen. El trigger del trabajo no es
+el request: es el consumer de Kafka (`KafkaSummaryConsumer`, corriendo en el lifespan), que
+cuando recibe el evento `documents.extracted` publicado por extraction resume el documento
+(fetch desde persistence, recorte, Ollama) y guarda el resultado en esa misma clave.
 
-- **Miss**: `POST` responde `202 {"status": "queued"}` y el resumen corre en background
-  (tarea asyncio en proceso, sin colas externas). Si viene un segundo `POST` mientras corre,
-  responde `202` con el estado actual sin duplicar el job; si el resumen ya terminó, responde
-  `200` al instante sin volver a inferir.
+- **Miss**: `POST` responde `202 {"status": "queued"}` y deja el estado en Redis; el consumer
+  hace el resumen cuando toma el evento. Un segundo `POST` responde `202` con el estado actual;
+  si el resumen ya terminó, responde `200` al instante sin volver a inferir.
 - **`GET`** devuelve `200 {summary, document_id}` si terminó, `202 {"status": "processing"}` si
   está corriendo, y `404` si nunca se pidió.
-- **Fail-open**: si Redis no responde, `POST` degrada al flujo síncrono de siempre y responde
-  `200`; la caché nunca provoca un 5xx.
+- **At-least-once + idempotencia**: el offset se confirma después de procesar, no antes; si el
+  proceso se cae, los eventos sin confirmar se reprocesan al reiniciar y el chequeo de caché
+  evita dobles resúmenes.
+- **Fail-open**: si el broker de Kafka no responde al arrancar, el servicio levanta igual sin
+  consumer (log de warning); la caché nunca provoca un 5xx.
 
 ## Integración en el compose
 
@@ -68,6 +73,7 @@ environment:
   MAX_SUMMARY_CHARS: "2400"
   REDIS_URL: redis://redis:6379/0
   SUMMARY_CACHE_TTL_SECONDS: "3600"
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   CORS_ORIGINS: http://localhost
 ports:
   - "8004:8000"
@@ -79,12 +85,10 @@ ports:
 
 | Situación | Respuesta |
 | --- | --- |
-| Documento inexistente | `404` |
-| persistence-service caído o con error | `502` |
-| `OLLAMA_MODEL` inexistente en Ollama (404) | `503` con mensaje de configuración |
-| Prompt/contexto demasiado largo (400) | `422` indicando `MAX_SUMMARY_CHARS` |
-| Ollama caído o error interno (5xx) | `502` |
-| Timeout de Ollama | `504` |
+| Documento inexistente | `404` en `GET` si nunca se pidió |
+| Redis caído | Fail-open: `POST` sigue respondiendo `202`; `GET` puede responder `404` |
+| Broker de Kafka caído | El servicio levanta sin consumer (warning); no hay resúmenes nuevos hasta reiniciar |
+| Ollama caído, timeout o error de dominio durante el resumen | El consumer loguea el error, no confirma el offset y sigue con el próximo evento |
 
 `/health` responde `200` solo si Ollama responde a `GET /api/tags` (timeout corto, ~3 s);
 si no, responde `503` con `"status": "unhealthy"`.
@@ -93,8 +97,11 @@ si no, responde `503` con `"status": "unhealthy"`.
 
 - `llm.py`: puerto `LlmClient` (Protocol) y adaptador `OllamaLlmClient`, que es el único lugar
   que conoce la API de Ollama y traduce sus fallos a errores de dominio.
-- `cache.py`: puerto `SummaryCache` (Protocol, `get`/`set`), `NoopSummaryCache` (flujo síncrono)
-  y `RedisSummaryCache` (clave única con TTL y fail-open); mismo patrón que `llm.py`.
+- `cache.py`: puerto `SummaryCache` (Protocol, `get`/`set`), `NoopSummaryCache` y
+  `RedisSummaryCache` (clave única con TTL y fail-open); mismo patrón que `llm.py`.
+- `consumer.py`: `KafkaSummaryConsumer`, que consume `documents.extracted` en el lifespan,
+  dispara `SummaryService.process` por evento y confirma el offset solo después de resolverlo
+  (at-least-once + idempotencia); el adaptador aiokafka se inyecta en los tests.
 - `app.py`: `SummaryService` (obtener documento → recortar a inicio + final → resumir), el
   estado del job y `Settings`.
 - `routes.py`: endpoints que resuelven las dependencias con `Depends`; los tests inyectan un

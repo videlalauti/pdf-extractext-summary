@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     summary_cache_ttl_seconds: int = Field(default=3600, gt=0)
     summary_cache_enabled: bool = True
+    kafka_bootstrap_servers: str = "localhost:9092"
     log_level: str = "INFO"
 
 
@@ -109,11 +110,11 @@ def build_prompt(content: str, max_chars: int) -> str:
 
 
 class SummaryService:
-    """Orquesta la obtención del documento, el recorte y la llamada al LLM.
+    """Obtiene el documento, lo recorta y lo resume; deja estado y resultado en la caché.
 
-    Cuando la caché aplica (Redis), el resumen corre en background con estado
-    guardado en la caché; sin caché (Noop o Redis caído) mantiene el flujo
-    síncrono de siempre.
+    El trigger del trabajo es el consumer de Kafka (`documents.extracted`), que
+    llama a `process`; los endpoints solo leen el estado con `peek_job` y lo
+    marcan como `queued` con `enqueue`.
     """
 
     def __init__(
@@ -132,26 +133,23 @@ class SummaryService:
         self._max_summary_chars = max_summary_chars
         self._cache = cache if cache is not None else NoopSummaryCache()
 
-    async def summarize(self, document_id: str) -> SummaryResponse:
-        """Resumen síncrono: el flujo original, usado cuando la caché degrada."""
-        summary = await self._generate_summary(document_id)
-        return SummaryResponse(summary=summary, document_id=document_id)
-
     async def peek_job(self, document_id: str) -> SummaryJob | None:
         """Devuelve el job guardado en la caché (estado + resultado) o None si es miss."""
         return parse_job(await self._cache.get(build_summary_key(document_id)))
 
     async def enqueue(self, document_id: str) -> bool:
-        """Marca el job como encolado. False = no se pudo guardar y hay que degradar."""
+        """Marca el job como encolado. False = no se pudo guardar (Redis caído)."""
         return await self._cache.set(
             build_summary_key(document_id), serialize_job(JOB_STATE_QUEUED)
         )
 
-    async def process(self, document_id: str) -> None:
-        """Corre el job en background: processing → resumen → done + resultado.
+    async def process(self, document_id: str) -> bool:
+        """Resumen un documento: processing → resumen → done + resultado en la caché.
 
-        Si el resumen falla se loguea y el estado queda en processing hasta que
-        expire el TTL; no hay estado intermedio de error (KISS).
+        Devuelve True solo si el resultado quedó guardado; si algo falla se
+        loguea y devuelve False (el estado queda en processing hasta que expire
+        el TTL), sin propagar: quien decide el reintento es el consumer, que
+        confirma el offset únicamente con True (at-least-once).
         """
         key = build_summary_key(document_id)
         await self._cache.set(key, serialize_job(JOB_STATE_PROCESSING))
@@ -159,10 +157,10 @@ class SummaryService:
             summary = await self._generate_summary(document_id)
         except Exception:
             logger.exception(
-                "el job de %s falló; el TTL de la caché limpiará el estado", document_id
+                "el resumen de %s falló; el TTL de la caché limpiará el estado", document_id
             )
-            return
-        await self._cache.set(key, serialize_job(JOB_STATE_DONE, summary=summary))
+            return False
+        return await self._cache.set(key, serialize_job(JOB_STATE_DONE, summary=summary))
 
     async def _generate_summary(self, document_id: str) -> str:
         document = await self._fetch_document(document_id)
@@ -184,3 +182,25 @@ class SummaryService:
             logger.warning("no se pudo conectar con persistence-service: %s", type(exc).__name__)
             raise PersistenceUnavailableError from exc
         return response.json()
+
+
+def build_summary_service(
+    document_client: httpx.AsyncClient,
+    llm_client: LlmClient,
+    cache: SummaryCache,
+    config: Settings | None = None,
+) -> SummaryService:
+    """Compone el servicio con la config dada (o la del entorno).
+
+    Lo usan el lifespan (para el consumer de Kafka) y `routes.py` (para los
+    endpoints), así ambos caminos corren la misma lógica de resumen.
+    """
+    config = config if config is not None else settings
+    return SummaryService(
+        document_client=document_client,
+        persistence_url=config.persistence_service_url,
+        llm_client=llm_client,
+        model=config.ollama_model,
+        max_summary_chars=config.max_summary_chars,
+        cache=cache,
+    )

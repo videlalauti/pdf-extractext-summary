@@ -2,9 +2,11 @@
 #   uv pip compile requirements.txt --python-platform linux --python-version 3.14 \
 #     --no-header --no-annotate --output-file requirements.lock.txt
 # Regenerar cuando cambien las dependencias de requirements.txt.
+aiokafka==0.14.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
+async-timeout==5.0.1
 certifi==2026.7.22
 click==8.5.0
 fastapi==0.141.1
@@ -14,6 +16,7 @@ httpcore==1.0.9
 httptools==0.8.0
 httpx==0.28.1
 idna==3.20
+packaging==26.3
 pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.1.0.zip
 pydantic==2.13.5
 pydantic-core==2.46.5
