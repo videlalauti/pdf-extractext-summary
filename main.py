@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 from shared.web.cors import add_cors
-from shared.web.logging import RequestIdMiddleware, setup_logging
+from shared.web.logging import RequestIdMiddleware, TimingMiddleware, setup_logging
 
 from app import settings
 from cache import RedisSummaryCache
@@ -41,6 +41,9 @@ def create_app() -> FastAPI:
             await document_client.aclose()
 
     application = FastAPI(title="PDF Summary Service", version="1.0.0", lifespan=lifespan)
+    # Timing se registra antes de RequestId (en Starlette el último queda más
+    # afuera): así corre por dentro y su log de duración lleva el request_id.
+    application.add_middleware(TimingMiddleware)
     application.add_middleware(RequestIdMiddleware)
     add_cors(application)
     register_error_handlers(application)
