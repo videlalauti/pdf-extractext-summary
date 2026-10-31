@@ -28,10 +28,11 @@ class FakeLlmClient:
     async def generate(self, model: str, prompt: str) -> str:
         self.prompts.append(prompt)
         self.models.append(model)
-        if self.error is not None:
-            raise self.error
+        # El delay aplica también al error: permite simular un timeout que tardó N segundos.
         if self.delay is not None:
             await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
         return self.summary
 
     async def is_available(self) -> bool:

@@ -2,6 +2,8 @@
 
 import json
 import logging
+import time
+from dataclasses import dataclass
 
 import httpx
 from pydantic import BaseModel, Field
@@ -109,6 +111,25 @@ def build_prompt(content: str, max_chars: int) -> str:
     )
 
 
+@dataclass
+class SummaryTimings:
+    """Tiempos del job en milisegundos; se escriben aunque el resumen falle.
+
+    El formatter no imprime ``extra``, así que estos valores se embeben en el
+    mensaje de log. Se acumulan en un objeto mutable porque en el camino de
+    excepción un valor de retorno se perdería y la línea de error saldría en
+    ceros.
+    """
+
+    fetch_ms: float = 0.0
+    ollama_ms: float = 0.0
+    total_ms: float = 0.0
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return (time.perf_counter() - started_at) * 1000
+
+
 class SummaryService:
     """Obtiene el documento, lo recorta y lo resume; deja estado y resultado en la caché.
 
@@ -147,26 +168,62 @@ class SummaryService:
         """Resumen un documento: processing → resumen → done + resultado en la caché.
 
         Devuelve True solo si el resultado quedó guardado; si algo falla se
-        loguea y devuelve False (el estado queda en processing hasta que expire
-        el TTL), sin propagar: quien decide el reintento es el consumer, que
-        confirma el offset únicamente con True (at-least-once).
+        loguea (con los tiempos medidos hasta la excepción) y devuelve False
+        (el estado queda en processing hasta que expire el TTL), sin propagar:
+        quien decide el reintento es el consumer, que confirma el offset
+        únicamente con True (at-least-once).
         """
         key = build_summary_key(document_id)
         await self._cache.set(key, serialize_job(JOB_STATE_PROCESSING))
+        timings = SummaryTimings()
         try:
-            summary = await self._generate_summary(document_id)
-        except Exception:
-            logger.exception(
-                "el resumen de %s falló; el TTL de la caché limpiará el estado", document_id
+            summary = await self._generate_summary(document_id, timings)
+        except Exception as error:
+            # Una sola línea por job: métricas primero y traceback adjunto al
+            # mismo record (exc_info), nunca el mensaje del error (filtra URL).
+            logger.error(
+                "resumen fallido document_id=%s fetch_ms=%.2f ollama_ms=%.2f total_ms=%.2f "
+                "error=%s",
+                document_id,
+                timings.fetch_ms,
+                timings.ollama_ms,
+                timings.total_ms,
+                type(error).__name__,
+                exc_info=error,
             )
             return False
+        logger.info(
+            "resumen completado document_id=%s fetch_ms=%.2f ollama_ms=%.2f total_ms=%.2f",
+            document_id,
+            timings.fetch_ms,
+            timings.ollama_ms,
+            timings.total_ms,
+        )
         return await self._cache.set(key, serialize_job(JOB_STATE_DONE, summary=summary))
 
-    async def _generate_summary(self, document_id: str) -> str:
-        document = await self._fetch_document(document_id)
-        content = document.get("content") or ""
-        prompt = build_prompt(content, self._max_summary_chars)
-        return await self._llm_client.generate(self._model, prompt)
+    async def _generate_summary(self, document_id: str, timings: SummaryTimings) -> str:
+        """Genera el resumen midiendo fetch y Ollama; total = la generación completa.
+
+        Los ``try/finally`` dejan escrito el tiempo transcurrido aunque la
+        excepción vuele: un timeout de Ollama reporta ``ollama_ms`` real y un
+        fallo de persistence reporta ``fetch_ms`` con ``ollama_ms`` en cero.
+        """
+        started_at = time.perf_counter()
+        try:
+            fetch_started_at = time.perf_counter()
+            try:
+                document = await self._fetch_document(document_id)
+            finally:
+                timings.fetch_ms = _elapsed_ms(fetch_started_at)
+            content = document.get("content") or ""
+            prompt = build_prompt(content, self._max_summary_chars)
+            ollama_started_at = time.perf_counter()
+            try:
+                return await self._llm_client.generate(self._model, prompt)
+            finally:
+                timings.ollama_ms = _elapsed_ms(ollama_started_at)
+        finally:
+            timings.total_ms = _elapsed_ms(started_at)
 
     async def _fetch_document(self, document_id: str) -> dict:
         url = f"{self._persistence_url}/documents/{document_id}"
