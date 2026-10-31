@@ -25,6 +25,7 @@ import logging
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer
+from shared.web.logging import new_request_id, reset_request_id, set_request_id
 
 from app import JOB_STATE_DONE, SummaryService
 
@@ -37,18 +38,40 @@ CONSUMER_GROUP_ID = "summary-service"
 KAFKA_REQUEST_TIMEOUT_MS = 2000
 
 
-def _document_id_of(value: bytes | str | None) -> str | None:
-    """Extrae el ``document_id`` del evento; None si el mensaje no es interpretable."""
+def _parse_event(value: bytes | str | None) -> dict | None:
+    """Interpreta el mensaje como dict; None (ya logueado) si no es un JSON de objeto."""
     try:
         event = json.loads(value)
-        document_id = event["document_id"]
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError):
+        event = None
+    if not isinstance(event, dict):
         logger.error("mensaje sin JSON interpretable en %s: %r", DOCUMENTS_EXTRACTED_TOPIC, value)
         return None
+    return event
+
+
+def _document_id_of(event: dict | None) -> str | None:
+    """Valida el ``document_id`` del evento ya parseado; None si falta o no es un str."""
+    if event is None:
+        return None
+    document_id = event.get("document_id")
     if not isinstance(document_id, str) or not document_id:
-        logger.error("evento sin document_id válido en %s: %r", DOCUMENTS_EXTRACTED_TOPIC, value)
+        logger.error("evento sin document_id válido en %s: %r", DOCUMENTS_EXTRACTED_TOPIC, event)
         return None
     return document_id
+
+
+def _request_id_of(event: dict | None) -> str:
+    """Hereda el ``request_id`` del evento; si falta o no sirve, genera uno nuevo.
+
+    El campo es aditivo y opcional (productores viejos no lo mandan), por eso se
+    tolera su ausencia y se cae a un id nuevo en lugar de propagar ``-``.
+    """
+    if event is not None:
+        request_id = event.get("request_id")
+        if isinstance(request_id, str) and request_id and request_id != "-":
+            return request_id
+    return new_request_id()
 
 
 class KafkaSummaryConsumer:
@@ -117,23 +140,30 @@ class KafkaSummaryConsumer:
             logger.exception("el consumer de %s terminó inesperadamente", self._topic)
 
     async def process_message(self, message: Any) -> None:
-        """Resuelve un mensaje y confirma el offset solo si quedó resuelto."""
+        """Resuelve un mensaje y confirma el offset solo si quedó resuelto.
+
+        Hereda el ``request_id`` del evento (o genera uno si el productor no lo
+        trae) y lo restaura en un ``finally``: el contextvar no debe filtrarse
+        al mensaje siguiente, ni siquiera cuando el procesamiento falla y el
+        offset no se confirma.
+        """
+        event = _parse_event(message.value)
+        token = set_request_id(_request_id_of(event))
         try:
-            resolved = await self._resolve(message.value)
+            document_id = _document_id_of(event)
+            # Inválido: nunca va a ser procesable; se confirma para no atorar la cola.
+            resolved = True if document_id is None else await self._resolve(document_id)
+            if resolved:
+                await self._commit()
         except Exception:
             logger.exception(
                 "no se pudo procesar un mensaje de %s; no se confirma el offset", self._topic
             )
-            return
-        if resolved:
-            await self._commit()
+        finally:
+            reset_request_id(token)
 
-    async def _resolve(self, value: bytes | str | None) -> bool:
+    async def _resolve(self, document_id: str) -> bool:
         """True = mensaje resuelto (procesado o descartado); False = falló (reprocesar)."""
-        document_id = _document_id_of(value)
-        if document_id is None:
-            # Inválido: nunca va a ser procesable; confirmar para no atorar la cola.
-            return True
         job = await self._service.peek_job(document_id)
         if job is not None and job.status == JOB_STATE_DONE:
             logger.info("documento %s ya resumido; se omite", document_id)

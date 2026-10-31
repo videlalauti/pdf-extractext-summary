@@ -4,6 +4,7 @@ import logging
 from typing import Protocol, runtime_checkable
 
 import httpx
+from shared.web.logging import request_id_header
 
 from errors import (
     LlmModelNotFoundError,
@@ -55,7 +56,9 @@ class OllamaLlmClient:
             "options": {"num_predict": MAX_PREDICT_TOKENS},
         }
         try:
-            response = await self._client.post(f"{self._base_url}/api/generate", json=payload)
+            response = await self._client.post(
+                f"{self._base_url}/api/generate", json=payload, headers=request_id_header()
+            )
         except httpx.TimeoutException as exc:
             logger.warning("timeout de Ollama generating con el modelo %s", model)
             raise LlmTimeoutError from exc

@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import httpx
 import pytest
+from shared.web.logging import reset_request_id, set_request_id
 
 from errors import (
     LlmModelNotFoundError,
@@ -157,3 +158,31 @@ async def test_is_available_false_si_ollama_no_responde():
         assert await client.is_available() is False
     finally:
         await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_generate_propaga_el_request_id():
+    requests: list[httpx.Request] = []
+    client = build_client(records_into(requests, json={"response": "resumen"}))
+    token = set_request_id("req-abc")
+
+    try:
+        await client.generate("llama3.2", PROMPT)
+    finally:
+        reset_request_id(token)
+        await client.aclose()
+
+    assert requests[0].headers["x-request-id"] == "req-abc"
+
+
+@pytest.mark.anyio
+async def test_generate_sin_request_id_no_envia_la_cabecera():
+    requests: list[httpx.Request] = []
+    client = build_client(records_into(requests, json={"response": "resumen"}))
+
+    try:
+        await client.generate("llama3.2", PROMPT)
+    finally:
+        await client.aclose()
+
+    assert "x-request-id" not in requests[0].headers

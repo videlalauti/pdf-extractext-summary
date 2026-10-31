@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import httpx
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+from shared.web.logging import request_id_header
 
 from cache import NoopSummaryCache, SummaryCache
 from errors import (
@@ -228,7 +229,7 @@ class SummaryService:
     async def _fetch_document(self, document_id: str) -> dict:
         url = f"{self._persistence_url}/documents/{document_id}"
         try:
-            response = await self._document_client.get(url)
+            response = await self._document_client.get(url, headers=request_id_header())
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:

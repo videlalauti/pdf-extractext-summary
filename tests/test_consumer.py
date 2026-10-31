@@ -6,15 +6,27 @@ consumer de ``documents.extracted`` corriendo en el lifespan.
 """
 
 import asyncio
+import contextlib
+import io
 import json
+import logging
+from collections.abc import Iterator
 from types import SimpleNamespace
 
+import httpx
+import pytest
 from fakes import (
     DEFAULT_CONTENT,
     FakeKafkaConsumer,
     FakeLlmClient,
     FakeSummaryCache,
     document_client,
+)
+from shared.web.logging import (
+    RequestIdFormatter,
+    get_request_id,
+    reset_request_id,
+    set_request_id,
 )
 
 from app import (
@@ -29,7 +41,39 @@ from consumer import KafkaSummaryConsumer
 from errors import LlmTimeoutError
 
 
-def event_message(document_id: str = "doc-1") -> SimpleNamespace:
+class RecordingLlmClient(FakeLlmClient):
+    """Registra el request_id vigente en cada generación (el contextvar del mensaje)."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.request_ids: list[str] = []
+
+    async def generate(self, model: str, prompt: str) -> str:
+        self.request_ids.append(get_request_id())
+        return await super().generate(model, prompt)
+
+
+@contextlib.contextmanager
+def formatted_logs() -> Iterator[io.StringIO]:
+    """Captura logs formateados en el momento del emit, con el request-id del contextvar.
+
+    ``caplog`` no aplica ``RequestIdFormatter`` y formatear los records al final
+    daría ``-`` (el consumer ya reseteó el contextvar): el handler tiene que
+    formatear mientras el mensaje se está procesando.
+    """
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(RequestIdFormatter("summary-service"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        yield stream
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+
+
+def event_message(document_id: str = "doc-1", request_id: str | None = None) -> SimpleNamespace:
     """Mensaje con el schema v1 del evento document.extracted (de extraction)."""
     payload = {
         "schema_version": 1,
@@ -37,6 +81,9 @@ def event_message(document_id: str = "doc-1") -> SimpleNamespace:
         "checksum": "abc",
         "source": "extraction",
     }
+    # Aditivo y opcional, igual que en extraction: solo viaja dentro de una request.
+    if request_id is not None:
+        payload["request_id"] = request_id
     return SimpleNamespace(value=json.dumps(payload).encode("utf-8"))
 
 
@@ -47,9 +94,12 @@ def build_consumer(
     kafka: FakeKafkaConsumer | None = None,
     config: Settings | None = None,
     status_code: int = 200,
+    client: httpx.AsyncClient | None = None,
 ) -> KafkaSummaryConsumer:
     service = build_summary_service(
-        document_client=document_client(content, status_code=status_code),
+        document_client=(
+            client if client is not None else document_client(content, status_code=status_code)
+        ),
         llm_client=llm if llm is not None else FakeLlmClient(),
         cache=cache if cache is not None else FakeSummaryCache(),
         config=config if config is not None else settings,
@@ -246,3 +296,122 @@ def test_el_consumer_respeta_el_tope_configurado():
     assert "a" * 11 not in prompt
     assert "b" * 11 not in prompt
     assert "20 caracteres" in prompt
+
+
+def test_hereda_el_request_id_del_evento():
+    llm = RecordingLlmClient()
+    consumer = build_consumer(
+        llm=llm, kafka=FakeKafkaConsumer([event_message(request_id="req-abc")])
+    )
+
+    asyncio.run(_consume_all(consumer))
+
+    assert llm.request_ids == ["req-abc"]
+
+
+@pytest.mark.parametrize("request_id", [None, "", "-"])
+def test_genera_un_request_id_si_el_evento_no_lo_trae(request_id):
+    llm = RecordingLlmClient()
+    consumer = build_consumer(
+        llm=llm, kafka=FakeKafkaConsumer([event_message(request_id=request_id)])
+    )
+
+    asyncio.run(_consume_all(consumer))
+
+    assert len(llm.request_ids) == 1
+    assert llm.request_ids[0] not in {"", "-"}
+
+
+def test_no_filtra_el_request_id_entre_mensajes():
+    llm = RecordingLlmClient()
+    kafka = FakeKafkaConsumer(
+        [
+            event_message("doc-1", request_id="req-1"),
+            event_message("doc-2", request_id="req-2"),
+            event_message("doc-3"),
+        ]
+    )
+    consumer = build_consumer(llm=llm, kafka=kafka)
+
+    asyncio.run(_consume_all(consumer))
+
+    assert llm.request_ids[:2] == ["req-1", "req-2"]
+    generado = llm.request_ids[2]
+    assert generado not in {"", "-", "req-1", "req-2"}
+
+
+def test_los_logs_del_consumer_llevan_el_request_id_heredado():
+    consumer = build_consumer(kafka=FakeKafkaConsumer([event_message(request_id="req-abc")]))
+
+    with formatted_logs() as stream:
+        asyncio.run(_consume_all(consumer))
+
+    salida = stream.getvalue()
+    assert "resumen completado" in salida
+    assert "req-abc" in salida
+
+
+def test_el_request_id_no_se_filtra_al_mensaje_siguiente_en_los_logs():
+    kafka = FakeKafkaConsumer(
+        [event_message("doc-1", request_id="req-abc"), event_message("doc-2")]
+    )
+    consumer = build_consumer(kafka=kafka)
+
+    with formatted_logs() as stream:
+        asyncio.run(_consume_all(consumer))
+
+    completados = [
+        line for line in stream.getvalue().splitlines() if "resumen completado" in line
+    ]
+    assert len(completados) == 2
+    assert "req-abc" in completados[0]
+    assert "req-abc" not in completados[1]
+
+
+def test_propaga_el_request_id_a_persistence():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, json={"id": "doc-1", "content": DEFAULT_CONTENT, "checksum": "abc"}
+        )
+
+    consumer = build_consumer(
+        kafka=FakeKafkaConsumer([event_message(request_id="req-abc")]),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    asyncio.run(_consume_all(consumer))
+
+    assert requests[0].headers["x-request-id"] == "req-abc"
+
+
+def test_restaura_el_request_id_previo_tras_un_exito():
+    consumer = build_consumer(kafka=FakeKafkaConsumer())
+
+    async def scenario():
+        token = set_request_id("req-previo")
+        try:
+            await consumer.process_message(event_message(request_id="req-evento"))
+            return get_request_id()
+        finally:
+            reset_request_id(token)
+
+    assert asyncio.run(scenario()) == "req-previo"
+
+
+def test_restaura_el_request_id_previo_tras_un_error():
+    kafka = FakeKafkaConsumer()
+    consumer = build_consumer(llm=FakeLlmClient(error=LlmTimeoutError()), kafka=kafka)
+
+    async def scenario():
+        token = set_request_id("req-previo")
+        try:
+            await consumer.process_message(event_message(request_id="req-evento"))
+            return get_request_id()
+        finally:
+            reset_request_id(token)
+
+    assert asyncio.run(scenario()) == "req-previo"
+    assert kafka.commits == 0
