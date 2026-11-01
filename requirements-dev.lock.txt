@@ -1,10 +1,10 @@
 # Lock file generado con:
-#   uv pip compile requirements-dev.txt --python-platform linux --python-version 3.14 \
+#   uv pip compile requirements-dev.txt --python-platform linux --python-version 3.13 \
 #     --no-header --no-annotate --output-file requirements-dev.lock.txt
 # Regenerar cuando cambien las dependencias de requirements-dev.txt.
-iniconfig==2.3.0
+iniconfig==2.3.1
 packaging==26.3
-pluggy==1.6.0
+pluggy==1.7.0
 pygments==2.21.0
-pytest==9.1.1
-ruff==0.16.9
+pytest==9.2.0
+ruff==0.17.3
