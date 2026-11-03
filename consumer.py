@@ -5,17 +5,18 @@ El servicio no depende de ``aiokafka`` en su lógica: el consumer recibe un
 ``SummaryCache``) y el adaptador AIOKafka se puede inyectar en los tests, igual
 que el resto de los adaptadores del repo.
 
-Commit de offset (elección y justificación): ``enable_auto_commit=False`` y el
-offset se confirma recién después de resolver el mensaje — procesado con éxito,
-resultado ya cacheado o descartado por inválido — y **nunca** si el
-procesamiento falló. Eso da semántica at-least-once: si el proceso se cae, los
-mensajes sin confirmar se reprocesan al volver, y el chequeo de idempotencia
-(evita re-inferir un resumen ya cacheado) hace seguro ese reenvío. El coste de
-reprocesar es barato (una llamada a Ollama que se skipea si ya hay resultado);
-el de perder un documento porque el offset se confirmó antes de tiempo, no.
+Commit de offset (elección y justificación): ``enable_auto_commit=False`` y se
+confirma **explícitamente** el offset del mensaje resuelto, con
+``{TopicPartition: offset + 1}``. Nunca se confirma la posición actual: los
+commits de Kafka son acumulativos, así que confirmar N+1 con N fallido marcaría
+N como consumido para siempre.
 
-Un mensaje fallido no tumba al consumer: se loguea el error, no se confirma el
-offset y el loop sigue con el siguiente mensaje.
+Si un mensaje falla no se avanza: se reintenta con ``seek`` al mismo offset y
+backoff, hasta ``MAX_ATTEMPTS_PER_MESSAGE``. Agotado el tope se descarta de
+forma controlada (commit explícito para liberar la partición) y se loguea en
+ERROR. Eso da semántica at-least-once: si el proceso se cae, los mensajes sin
+confirmar se reprocesan al volver, y el chequeo de idempotencia junto con el
+lock por documento hace seguro ese reenvío.
 """
 
 import asyncio
@@ -24,7 +25,7 @@ import json
 import logging
 from typing import Any
 
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, TopicPartition
 from shared.web.logging import new_request_id, reset_request_id, set_request_id
 
 from app import JOB_STATE_DONE, SummaryService
@@ -39,6 +40,10 @@ KAFKA_REQUEST_TIMEOUT_MS = 2000
 # Reintento del supervisor: 1s → 2s → 4s … con tope de 30s.
 CONSUMER_RETRY_INITIAL_SECONDS = 1.0
 CONSUMER_RETRY_MAX_SECONDS = 30.0
+# Un mensaje que falla se reintenta antes de descartarlo, para no perderlo.
+MAX_ATTEMPTS_PER_MESSAGE = 3
+MESSAGE_RETRY_INITIAL_SECONDS = 2.0
+MESSAGE_RETRY_MAX_SECONDS = 30.0
 
 
 def _parse_event(value: bytes | str | None) -> dict | None:
@@ -94,6 +99,8 @@ class KafkaSummaryConsumer:
         consumer: Any | None = None,
         retry_initial_seconds: float = CONSUMER_RETRY_INITIAL_SECONDS,
         retry_max_seconds: float = CONSUMER_RETRY_MAX_SECONDS,
+        message_retry_initial_seconds: float = MESSAGE_RETRY_INITIAL_SECONDS,
+        message_retry_max_seconds: float = MESSAGE_RETRY_MAX_SECONDS,
     ) -> None:
         self._service = service
         self._bootstrap_servers = bootstrap_servers
@@ -106,6 +113,10 @@ class KafkaSummaryConsumer:
         self._connected = False
         self._retry_initial_seconds = retry_initial_seconds
         self._retry_max_seconds = retry_max_seconds
+        self._message_retry_initial_seconds = message_retry_initial_seconds
+        self._message_retry_max_seconds = message_retry_max_seconds
+        # Intentos por (partición, offset) para el tope de descarte controlado.
+        self._failures: dict[tuple[TopicPartition, int], int] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -185,7 +196,7 @@ class KafkaSummaryConsumer:
             return
 
     async def process_message(self, message: Any) -> None:
-        """Resuelve un mensaje y confirma el offset solo si quedó resuelto.
+        """Resuelve un mensaje y confirma su offset exacto solo si quedó resuelto.
 
         Hereda el ``request_id`` del evento (o genera uno si el productor no lo
         trae) y lo restaura en un ``finally``: el contextvar no debe filtrarse
@@ -197,13 +208,26 @@ class KafkaSummaryConsumer:
         try:
             document_id = _document_id_of(event)
             # Inválido: nunca va a ser procesable; se confirma para no atorar la cola.
-            resolved = True if document_id is None else await self._resolve(document_id)
+            if document_id is None:
+                await self._commit(message)
+                return
+
+            try:
+                resolved = await self._resolve(document_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "no se pudo procesar un mensaje de %s; se reintenta el offset",
+                    self._topic,
+                )
+                resolved = False
+
             if resolved:
-                await self._commit()
-        except Exception:
-            logger.exception(
-                "no se pudo procesar un mensaje de %s; no se confirma el offset", self._topic
-            )
+                self._failures.pop(self._failure_key(message), None)
+                await self._commit(message)
+                return
+            await self._handle_failure(message, document_id)
         finally:
             reset_request_id(token)
 
@@ -215,12 +239,54 @@ class KafkaSummaryConsumer:
             return True
         return await self._service.process(document_id)
 
-    async def _commit(self) -> None:
+    @staticmethod
+    def _failure_key(message: Any) -> tuple[TopicPartition, int]:
+        return TopicPartition(message.topic, message.partition), message.offset
+
+    async def _handle_failure(self, message: Any, document_id: str) -> None:
+        """Reintenta el mismo offset o lo descarta tras agotar los intentos.
+
+        Confirmar N+1 también confirmaría N (los commits son acumulativos), así
+        que mientras N no se resuelva se hace ``seek`` a su offset. Al llegar al
+        tope se confirma explícitamente para liberar la partición.
+        """
+        tp, offset = self._failure_key(message)
+        attempts = self._failures.get((tp, offset), 0) + 1
+        if attempts >= MAX_ATTEMPTS_PER_MESSAGE:
+            logger.error(
+                "mensaje descartado tras %d intentos document_id=%s topic=%s partition=%d "
+                "offset=%d",
+                attempts,
+                document_id,
+                tp.topic,
+                tp.partition,
+                offset,
+            )
+            self._failures.pop((tp, offset), None)
+            await self._commit(message)
+            return
+
+        self._failures[(tp, offset)] = attempts
+        delay = min(
+            self._message_retry_initial_seconds * (2 ** (attempts - 1)),
+            self._message_retry_max_seconds,
+        )
+        await asyncio.sleep(delay)
+        consumer = self._consumer or self._injected_consumer
+        if consumer is not None:
+            consumer.seek(tp, offset)
+
+    async def _commit(self, message: Any) -> None:
+        """Confirma el offset exacto del mensaje, nunca la posición actual."""
+        tp, offset = self._failure_key(message)
+        consumer = self._consumer or self._injected_consumer
+        if consumer is None:
+            return
         try:
-            await self._consumer.commit()
+            await consumer.commit({tp: offset + 1})
         except Exception:
-            # No propagar: el offset se confirma en el siguiente mensaje o al reiniciar.
-            logger.warning("no se pudo confirmar el offset en %s", self._topic, exc_info=True)
+            # No propagar: se reintenta en el próximo mensaje o al reiniciar.
+            logger.warning("no se pudo confirmar %s offset=%d", tp, offset, exc_info=True)
 
     async def stop(self) -> None:
         """Corta el loop y cierra la conexión (disposability: shutdown ordenado)."""

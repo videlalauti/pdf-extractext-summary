@@ -57,10 +57,11 @@ en `queued` para siempre.
   resumen ya terminó, responde `200` al instante sin volver a inferir.
 - **`GET`** devuelve `200 {summary, document_id}` si terminó, `202 {"status": "processing"}` si
   está corriendo, y `404` si nunca se pidió.
-- **At-least-once + idempotencia**: el offset se confirma después de procesar, no antes; si el
-  proceso se cae, los eventos sin confirmar se reprocesan al reiniciar y el chequeo de caché
-  evita dobles resúmenes. Un lock por documento comparte la decisión entre el consumer y el
-  background del POST.
+- **At-least-once + idempotencia**: se confirma el offset exacto del mensaje resuelto, no la
+  posición actual; un mensaje fallido se reintenta con `seek` hasta 3 veces y recién entonces se
+  descarta con log `ERROR` para no atorar la partición. Si el proceso se cae, los eventos sin
+  confirmar se reprocesan al reiniciar y el chequeo de caché evita dobles resúmenes. Un lock por
+  documento comparte la decisión entre el consumer y el background del POST.
 - **Fail-open + reconexión**: si el broker de Kafka no responde al arrancar, el servicio levanta
   igual y reintenta con backoff exponencial hasta que vuelve; la caché nunca provoca un 5xx.
 

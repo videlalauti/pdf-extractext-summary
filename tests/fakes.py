@@ -72,6 +72,8 @@ class FakeKafkaConsumer:
         self.start_errors = list(start_errors or [])
         self.start_attempts = 0
         self.commits = 0
+        self.commit_offsets: list[dict] = []
+        self.seeks: list[tuple] = []
         self.stopped = False
 
     async def start(self) -> None:
@@ -79,8 +81,13 @@ class FakeKafkaConsumer:
         if self.start_errors:
             raise self.start_errors.pop(0)
 
-    async def commit(self) -> None:
+    async def commit(self, offsets=None) -> None:
         self.commits += 1
+        if offsets is not None:
+            self.commit_offsets.append(offsets)
+
+    def seek(self, tp, offset) -> None:
+        self.seeks.append((tp, offset))
 
     async def stop(self) -> None:
         self.stopped = True

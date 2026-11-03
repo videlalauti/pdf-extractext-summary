@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from aiokafka import TopicPartition
 from fakes import (
     DEFAULT_CONTENT,
     FakeKafkaConsumer,
@@ -37,7 +38,7 @@ from app import (
     settings,
 )
 from cache import SummaryCache
-from consumer import KafkaSummaryConsumer
+from consumer import DOCUMENTS_EXTRACTED_TOPIC, KafkaSummaryConsumer
 from errors import LlmTimeoutError
 
 
@@ -73,7 +74,14 @@ def formatted_logs() -> Iterator[io.StringIO]:
         handler.close()
 
 
-def event_message(document_id: str = "doc-1", request_id: str | None = None) -> SimpleNamespace:
+def event_message(
+    document_id: str = "doc-1",
+    request_id: str | None = None,
+    *,
+    offset: int = 0,
+    partition: int = 0,
+    topic: str = DOCUMENTS_EXTRACTED_TOPIC,
+) -> SimpleNamespace:
     """Mensaje con el schema v1 del evento document.extracted (de extraction)."""
     payload = {
         "schema_version": 1,
@@ -84,7 +92,12 @@ def event_message(document_id: str = "doc-1", request_id: str | None = None) -> 
     # Aditivo y opcional, igual que en extraction: solo viaja dentro de una request.
     if request_id is not None:
         payload["request_id"] = request_id
-    return SimpleNamespace(value=json.dumps(payload).encode("utf-8"))
+    return SimpleNamespace(
+        value=json.dumps(payload).encode("utf-8"),
+        topic=topic,
+        partition=partition,
+        offset=offset,
+    )
 
 
 def build_consumer(
@@ -113,6 +126,9 @@ def build_consumer(
         # Backoff corto: los tests no esperan los 1s/30s de producción.
         retry_initial_seconds=0.01,
         retry_max_seconds=0.05,
+        # Reintento del mensaje fallido sin esperas reales.
+        message_retry_initial_seconds=0.0,
+        message_retry_max_seconds=0.0,
     )
 
 
@@ -166,7 +182,9 @@ def test_un_fallo_de_llm_no_confirma_offset_ni_tumba_al_consumer():
     """
     llm = FakeLlmClient(error=LlmTimeoutError())
     cache = FakeSummaryCache()
-    kafka = FakeKafkaConsumer([event_message("doc-1"), event_message("doc-2")])
+    kafka = FakeKafkaConsumer(
+        [event_message("doc-1", offset=0), event_message("doc-2", offset=1)]
+    )
     consumer = build_consumer(llm=llm, cache=cache, kafka=kafka)
 
     asyncio.run(_consume_all(consumer))
@@ -174,6 +192,57 @@ def test_un_fallo_de_llm_no_confirma_offset_ni_tumba_al_consumer():
     assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_PROCESSING
     assert json.loads(cache.data["summary:doc-2"])["status"] == JOB_STATE_PROCESSING
     assert kafka.commits == 0
+    assert kafka.commit_offsets == []
+
+
+class FailOnceLlmClient(FakeLlmClient):
+    """Falla la primera generación y funciona en la siguiente."""
+
+    def __init__(self) -> None:
+        super().__init__(error=LlmTimeoutError())
+
+    async def generate(self, model: str, prompt: str) -> str:
+        try:
+            return await super().generate(model, prompt)
+        finally:
+            self.error = None
+
+
+def test_un_mensaje_fallido_no_queda_confirmado_por_el_siguiente():
+    """Regresión H02: N debe resolverse antes de que N+1 avance el offset."""
+    llm = FailOnceLlmClient()
+    kafka = FakeKafkaConsumer(
+        [
+            event_message("doc-1", offset=0),
+            # Kafka reentrega N tras el seek; recién después llega N+1.
+            event_message("doc-1", offset=0),
+            event_message("doc-2", offset=1),
+        ]
+    )
+    consumer = build_consumer(llm=llm, kafka=kafka)
+
+    asyncio.run(_consume_all(consumer))
+
+    tp = TopicPartition(DOCUMENTS_EXTRACTED_TOPIC, 0)
+    assert kafka.seeks == [(tp, 0)]
+    assert kafka.commit_offsets == [{tp: 1}, {tp: 2}]
+    # Tres intentos: N falla, N se reintenta con éxito y N+1 se procesa.
+    assert len(llm.prompts) == 3
+
+
+def test_un_mensaje_que_falla_tres_veces_se_descarta_controladamente(caplog):
+    """Tras el tope se confirma para no atorar la partición, con log ERROR."""
+    llm = FakeLlmClient(error=LlmTimeoutError())
+    kafka = FakeKafkaConsumer([event_message("doc-1", offset=0)] * 3)
+    consumer = build_consumer(llm=llm, kafka=kafka)
+    caplog.set_level(logging.ERROR)
+
+    asyncio.run(_consume_all(consumer))
+
+    tp = TopicPartition(DOCUMENTS_EXTRACTED_TOPIC, 0)
+    assert len(kafka.seeks) == 2
+    assert kafka.commit_offsets == [{tp: 1}]
+    assert "mensaje descartado tras 3 intentos" in caplog.text
 
 
 def test_documento_inexistente_no_confirma_el_offset():
@@ -190,9 +259,19 @@ def test_mensaje_invalido_se_descarta_sin_tumbar_al_consumer():
     llm = FakeLlmClient()
     kafka = FakeKafkaConsumer(
         [
-            SimpleNamespace(value=b"no es json"),
-            SimpleNamespace(value=json.dumps({"sin": "document_id"}).encode("utf-8")),
-            event_message(),
+            SimpleNamespace(
+                value=b"no es json",
+                topic=DOCUMENTS_EXTRACTED_TOPIC,
+                partition=0,
+                offset=0,
+            ),
+            SimpleNamespace(
+                value=json.dumps({"sin": "document_id"}).encode("utf-8"),
+                topic=DOCUMENTS_EXTRACTED_TOPIC,
+                partition=0,
+                offset=1,
+            ),
+            event_message(offset=2),
         ]
     )
     consumer = build_consumer(llm=llm, kafka=kafka)
@@ -366,9 +445,9 @@ def test_no_filtra_el_request_id_entre_mensajes():
     llm = RecordingLlmClient()
     kafka = FakeKafkaConsumer(
         [
-            event_message("doc-1", request_id="req-1"),
-            event_message("doc-2", request_id="req-2"),
-            event_message("doc-3"),
+            event_message("doc-1", request_id="req-1", offset=0),
+            event_message("doc-2", request_id="req-2", offset=1),
+            event_message("doc-3", offset=2),
         ]
     )
     consumer = build_consumer(llm=llm, kafka=kafka)
