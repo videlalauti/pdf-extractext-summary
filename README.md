@@ -114,5 +114,5 @@ si no, responde `503` con `"status": "unhealthy"`.
 El paquete `pdf-extractext-shared` se instala desde el tag, no desde PyPI:
 
 ```
-pip install "pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.2.0.zip"
+pip install "pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.3.0.zip"
 ```

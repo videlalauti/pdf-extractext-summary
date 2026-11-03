@@ -14,7 +14,7 @@ httpcore==1.0.9
 httpx==0.28.1
 idna==3.20
 opentelemetry-api==1.45.2
-pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.2.0.zip
+pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.3.0.zip
 pydantic==2.14.2
 pydantic-core==2.50.2
 pydantic-settings==2.16.2

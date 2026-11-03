@@ -4,4 +4,4 @@ httpx==0.28.1
 pydantic-settings==2.16.2
 redis==8.1.0
 aiokafka==0.15.0
-pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.2.0.zip
+pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.3.0.zip
