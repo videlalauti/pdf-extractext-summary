@@ -1,7 +1,7 @@
 """Summary service: endpoints HTTP para resumir documentos con Ollama."""
 
 import httpx
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from app import (
@@ -45,23 +45,30 @@ def get_summary_service(
 
 @router.post("/summary/{document_id}", response_model=None)
 async def submit_summary(
-    document_id: str, service: SummaryService = Depends(get_summary_service)
+    document_id: str,
+    background: BackgroundTasks,
+    service: SummaryService = Depends(get_summary_service),
 ) -> SummaryResponse | JSONResponse:
     """Devuelve el resumen si ya existe; si no, acepta el trabajo con 202.
 
     El trabajo lo dispara el consumer de Kafka con el evento
-    `documents.extracted`; el POST solo marca `queued` en la caché
-    (best-effort) para que GET responda 202 y no 404 mientras el consumer lo
-    toma.
+    `documents.extracted`, pero el POST también lo agenda en background: si el
+    evento se perdió (publicación fail-open, offset ya confirmado), el pedido
+    explícito del usuario no puede quedar en `queued` para siempre.
+    `BackgroundTasks` corre después de responder, así que el 202 no espera a
+    la inferencia de Ollama.
     """
     job = await service.peek_job(document_id)
     if job is not None and job.status == JOB_STATE_DONE:
         return SummaryResponse(summary=job.summary or "", document_id=document_id)
     if job is not None:
+        if job.status == JOB_STATE_QUEUED:
+            background.add_task(service.process, document_id)
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED, content={"status": job.status}
         )
     await service.enqueue(document_id)
+    background.add_task(service.process, document_id)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED, content={"status": JOB_STATE_QUEUED}
     )

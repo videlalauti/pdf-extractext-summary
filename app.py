@@ -1,5 +1,6 @@
 """Summary service: capa de aplicación, orquestación con persistence y Ollama."""
 
+import asyncio
 import json
 import logging
 import time
@@ -22,6 +23,25 @@ logger = logging.getLogger(__name__)
 JOB_STATE_QUEUED = "queued"
 JOB_STATE_PROCESSING = "processing"
 JOB_STATE_DONE = "done"
+
+# Locks por documento compartidos por todo el proceso: el consumer de Kafka y
+# el BackgroundTask del POST usan instancias distintas de SummaryService, así
+# que un lock de instancia no evitaría que ambos infieran el mismo documento.
+_document_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(document_id: str) -> asyncio.Lock:
+    lock = _document_locks.get(document_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _document_locks[document_id] = lock
+    return lock
+
+
+def _release_lock(document_id: str, lock: asyncio.Lock) -> None:
+    """Limpia el lock solo si nadie lo está usando ni esperando."""
+    if not lock.locked() and _document_locks.get(document_id) is lock:
+        _document_locks.pop(document_id, None)
 
 SUMMARY_PROMPT = "Resumí en español el siguiente texto:\n\n{content}"
 HEAD_TAIL_SUMMARY_PROMPT = (
@@ -168,39 +188,62 @@ class SummaryService:
     async def process(self, document_id: str) -> bool:
         """Resumen un documento: processing → resumen → done + resultado en la caché.
 
-        Devuelve True solo si el resultado quedó guardado; si algo falla se
-        loguea (con los tiempos medidos hasta la excepción) y devuelve False
-        (el estado queda en processing hasta que expire el TTL), sin propagar:
-        quien decide el reintento es el consumer, que confirma el offset
-        únicamente con True (at-least-once).
+        Es idempotente: si el job ya está ``done`` no vuelve a inferir. El lock
+        por documento (compartido por todo el proceso) evita que el consumer y
+        el BackgroundTask del POST infieran dos veces el mismo documento.
+
+        Devuelve True solo si el resultado quedó guardado (o ya lo estaba); si
+        algo falla se loguea (con los tiempos medidos hasta la excepción) y
+        devuelve False (el estado queda en processing hasta que expire el TTL),
+        sin propagar: quien decide el reintento es el consumer, que confirma el
+        offset únicamente con True (at-least-once).
         """
+        job = await self.peek_job(document_id)
+        if job is not None and job.status == JOB_STATE_DONE:
+            logger.info("documento %s ya resumido; no se vuelve a inferir", document_id)
+            return True
+
         key = build_summary_key(document_id)
-        await self._cache.set(key, serialize_job(JOB_STATE_PROCESSING))
-        timings = SummaryTimings()
+        lock = _lock_for(document_id)
         try:
-            summary = await self._generate_summary(document_id, timings)
-        except Exception as error:
-            # Una sola línea por job: métricas primero y traceback adjunto al
-            # mismo record (exc_info), nunca el mensaje del error (filtra URL).
-            logger.error(
-                "resumen fallido document_id=%s fetch_ms=%.2f ollama_ms=%.2f total_ms=%.2f "
-                "error=%s",
-                document_id,
-                timings.fetch_ms,
-                timings.ollama_ms,
-                timings.total_ms,
-                type(error).__name__,
-                exc_info=error,
-            )
-            return False
-        logger.info(
-            "resumen completado document_id=%s fetch_ms=%.2f ollama_ms=%.2f total_ms=%.2f",
-            document_id,
-            timings.fetch_ms,
-            timings.ollama_ms,
-            timings.total_ms,
-        )
-        return await self._cache.set(key, serialize_job(JOB_STATE_DONE, summary=summary))
+            async with lock:
+                # Re-chequeo: otro camino (consumer o background) pudo resolverlo
+                # mientras esperábamos el lock.
+                job = await self.peek_job(document_id)
+                if job is not None and job.status == JOB_STATE_DONE:
+                    logger.info("documento %s ya resumido; no se vuelve a inferir", document_id)
+                    return True
+
+                await self._cache.set(key, serialize_job(JOB_STATE_PROCESSING))
+                timings = SummaryTimings()
+                try:
+                    summary = await self._generate_summary(document_id, timings)
+                except Exception as error:
+                    # Una sola línea por job: métricas primero y traceback adjunto al
+                    # mismo record (exc_info), nunca el mensaje del error (filtra URL).
+                    logger.error(
+                        "resumen fallido document_id=%s fetch_ms=%.2f ollama_ms=%.2f "
+                        "total_ms=%.2f error=%s",
+                        document_id,
+                        timings.fetch_ms,
+                        timings.ollama_ms,
+                        timings.total_ms,
+                        type(error).__name__,
+                        exc_info=error,
+                    )
+                    return False
+                logger.info(
+                    "resumen completado document_id=%s fetch_ms=%.2f ollama_ms=%.2f total_ms=%.2f",
+                    document_id,
+                    timings.fetch_ms,
+                    timings.ollama_ms,
+                    timings.total_ms,
+                )
+                return await self._cache.set(
+                    key, serialize_job(JOB_STATE_DONE, summary=summary)
+                )
+        finally:
+            _release_lock(document_id, lock)
 
     async def _generate_summary(self, document_id: str, timings: SummaryTimings) -> str:
         """Genera el resumen midiendo fetch y Ollama; total = la generación completa.

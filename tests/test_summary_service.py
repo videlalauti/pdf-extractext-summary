@@ -1,9 +1,10 @@
 """Tests del contrato HTTP de resumen: POST acepta, GET consulta, health y Settings."""
 
+import asyncio
 import json
 
 import pytest
-from fakes import FakeLlmClient, FakeSummaryCache
+from fakes import FakeLlmClient, FakeSummaryCache, document_client
 from pydantic import ValidationError
 
 from app import (
@@ -11,6 +12,8 @@ from app import (
     JOB_STATE_PROCESSING,
     JOB_STATE_QUEUED,
     Settings,
+    build_summary_service,
+    settings,
 )
 from llm import LlmClient
 
@@ -65,14 +68,43 @@ def test_post_responde_202_queued_cuando_no_hay_resumen(build_client):
     assert response.json() == {"status": JOB_STATE_QUEUED}
 
 
-def test_post_no_dispara_el_procesamiento(build_client):
-    """Ni llama al LLM ni lanza tareas: el resumen lo dispara el evento."""
+def test_post_dispara_el_procesamiento_aunque_no_llegue_el_evento(build_client):
+    """Red de seguridad: el POST agenda process y no depende solo de Kafka."""
     llm = FakeLlmClient()
+    cache = FakeSummaryCache()
 
-    with build_client(llm_client=llm, cache=FakeSummaryCache()) as client:
-        assert client.post("/summary/doc-1").status_code == 202
-        assert client.post("/summary/doc-1").status_code == 202
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.post("/summary/doc-1")
 
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_QUEUED}
+    assert len(llm.prompts) == 1
+    assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_DONE
+
+
+def test_post_con_job_queued_reintenta_el_procesamiento(build_client):
+    """Un job que quedó encolado sin evento también se destraba con el POST."""
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_QUEUED)
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.post("/summary/doc-1")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_QUEUED}
+    assert len(llm.prompts) == 1
+
+
+def test_post_con_job_processing_no_agenda_otra_inferencia(build_client):
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_PROCESSING)
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.post("/summary/doc-1")
+
+    assert response.status_code == 202
     assert llm.prompts == []
 
 
@@ -135,13 +167,13 @@ def test_get_devuelve_202_mientras_el_consumer_procesa(build_client):
     assert response.json() == {"status": JOB_STATE_PROCESSING}
 
 
-def test_get_devuelve_202_queued_tras_el_post(build_client):
+def test_get_devuelve_200_tras_el_post_que_dispara_el_resumen(build_client):
     with build_client(cache=FakeSummaryCache()) as client:
         assert client.post("/summary/doc-1").status_code == 202
         response = client.get("/summary/doc-1")
 
-    assert response.status_code == 202
-    assert response.json() == {"status": JOB_STATE_QUEUED}
+    assert response.status_code == 200
+    assert response.json()["summary"] == "resumen de prueba"
 
 
 def test_get_sin_resumen_devuelve_404(build_client):
@@ -149,3 +181,46 @@ def test_get_sin_resumen_devuelve_404(build_client):
         response = client.get("/summary/doc-1")
 
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# process: idempotencia y concurrencia entre consumer y background
+# --------------------------------------------------------------------------- #
+
+
+def _service(llm: FakeLlmClient, cache: FakeSummaryCache):
+    return build_summary_service(
+        document_client=document_client(),
+        llm_client=llm,
+        cache=cache,
+        config=settings,
+    )
+
+
+def test_process_no_vuelve_a_inferir_un_job_done():
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_DONE, summary="ya resumido")
+
+    assert asyncio.run(_service(llm, cache).process("doc-1")) is True
+
+    assert llm.prompts == []
+    assert json.loads(cache.data["summary:doc-1"])["summary"] == "ya resumido"
+
+
+def test_consumer_y_background_comparten_el_lock_por_documento():
+    """Dos instancias del servicio (consumer y POST) infieren una sola vez."""
+    llm = FakeLlmClient(delay=0.05)
+    cache = FakeSummaryCache()
+    consumer_service = _service(llm, cache)
+    background_service = _service(llm, cache)
+
+    async def scenario():
+        return await asyncio.gather(
+            consumer_service.process("doc-1"),
+            background_service.process("doc-1"),
+        )
+
+    assert asyncio.run(scenario()) == [True, True]
+    assert len(llm.prompts) == 1
+    assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_DONE
