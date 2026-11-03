@@ -15,7 +15,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.13"
           cache: pip
           cache-dependency-path: |
             requirements.lock.txt
@@ -29,5 +29,5 @@ jobs:
       - name: Lint with ruff
         run: ruff check .
 
-      - name: Run tests
-        run: pytest tests/ -v
+      - name: Run tests with coverage
+        run: pytest tests/ -v --cov=. --cov-report=term-missing --cov-fail-under=80
