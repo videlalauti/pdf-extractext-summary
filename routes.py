@@ -14,6 +14,7 @@ from app import (
     get_settings,
 )
 from cache import SummaryCache
+from consumer import KafkaSummaryConsumer
 from errors import DocumentNotFoundError
 from llm import LlmClient
 
@@ -30,6 +31,10 @@ def get_document_client(request: Request) -> httpx.AsyncClient:
 
 def get_summary_cache(request: Request) -> SummaryCache:
     return request.app.state.summary_cache
+
+
+def get_summary_consumer(request: Request) -> KafkaSummaryConsumer:
+    return request.app.state.summary_consumer
 
 
 def get_summary_service(
@@ -90,8 +95,20 @@ async def get_summary(
 
 
 @router.get("/health")
-async def health(response: Response, llm_client: LlmClient = Depends(get_llm_client)) -> dict:
-    if not await llm_client.is_available():
+async def health(
+    response: Response,
+    llm_client: LlmClient = Depends(get_llm_client),
+    summary_consumer: KafkaSummaryConsumer = Depends(get_summary_consumer),
+) -> dict:
+    """Estado real del servicio: Ollama y el consumer de Kafka, no solo uno."""
+    ollama_ok = await llm_client.is_available()
+    kafka_ok = summary_consumer.is_connected
+    body = {
+        "status": "healthy" if ollama_ok and kafka_ok else "unhealthy",
+        "service": "summary-service",
+        "ollama": "reachable" if ollama_ok else "unreachable",
+        "kafka": "connected" if kafka_ok else "disconnected",
+    }
+    if not ollama_ok or not kafka_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "unhealthy", "service": "summary-service", "ollama": "unreachable"}
-    return {"status": "healthy", "service": "summary-service", "ollama": "reachable"}
+    return body

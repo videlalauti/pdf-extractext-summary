@@ -36,6 +36,9 @@ CONSUMER_GROUP_ID = "summary-service"
 # Timeout acotado: si Kafka está caído, fallar rápido en el arranque (fail-open)
 # en lugar de dejar el lifespan esperando el timeout por defecto.
 KAFKA_REQUEST_TIMEOUT_MS = 2000
+# Reintento del supervisor: 1s → 2s → 4s … con tope de 30s.
+CONSUMER_RETRY_INITIAL_SECONDS = 1.0
+CONSUMER_RETRY_MAX_SECONDS = 30.0
 
 
 def _parse_event(value: bytes | str | None) -> dict | None:
@@ -89,23 +92,33 @@ class KafkaSummaryConsumer:
         topic: str = DOCUMENTS_EXTRACTED_TOPIC,
         group_id: str = CONSUMER_GROUP_ID,
         consumer: Any | None = None,
+        retry_initial_seconds: float = CONSUMER_RETRY_INITIAL_SECONDS,
+        retry_max_seconds: float = CONSUMER_RETRY_MAX_SECONDS,
     ) -> None:
         self._service = service
         self._bootstrap_servers = bootstrap_servers
         self._topic = topic
         self._group_id = group_id
         # Inyectable para tests (patrón de fakes del repo); si no, el de aiokafka.
-        self._consumer = consumer
+        self._injected_consumer = consumer
+        self._consumer: Any | None = None
         self._task: asyncio.Task | None = None
+        self._connected = False
+        self._retry_initial_seconds = retry_initial_seconds
+        self._retry_max_seconds = retry_max_seconds
 
-    async def start(self) -> None:
-        """Arranca el loop de consumo en background; un broker caído no frena el arranque.
+    @property
+    def is_connected(self) -> bool:
+        """True mientras el consumer haya arrancado y no se haya caído/cerrado."""
+        return self._connected
 
-        aiokafka acota su propio retry de bootstrap (~4 s si el broker rechaza
-        la conexión): el fail-open garantiza que el servicio levante igual, sin
-        consumer, en vez de morir en el lifespan.
-        """
-        consumer = self._consumer or AIOKafkaConsumer(
+    @property
+    def is_running(self) -> bool:
+        """True mientras la tarea supervisora siga viva."""
+        return self._task is not None and not self._task.done()
+
+    def _build_consumer(self) -> Any:
+        return AIOKafkaConsumer(
             self._topic,
             bootstrap_servers=self._bootstrap_servers,
             group_id=self._group_id,
@@ -115,29 +128,61 @@ class KafkaSummaryConsumer:
             enable_auto_commit=False,
             request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
         )
-        try:
-            await consumer.start()
-        except Exception as error:
-            logger.warning(
-                "Kafka no disponible (%s); el servicio arranca sin consumer: %s",
-                self._bootstrap_servers,
-                type(error).__name__,
-                exc_info=True,
-            )
-            with contextlib.suppress(Exception):
-                await consumer.stop()
-            return
-        self._consumer = consumer
-        self._task = asyncio.create_task(self._run())
 
-    async def _run(self) -> None:
-        try:
-            async for message in self._consumer:
-                await self.process_message(message)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("el consumer de %s terminó inesperadamente", self._topic)
+    async def start(self) -> None:
+        """Lanza el supervisor que conecta con Kafka y reintenta si falla.
+
+        La tarea arranca en background: un broker caído no frena el lifespan
+        (fail-open) y el servicio se reconecta solo cuando Kafka vuelve.
+        """
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._supervise())
+
+    async def _supervise(self) -> None:
+        """Conecta con backoff exponencial y supervisa el loop de consumo."""
+        delay = self._retry_initial_seconds
+        while True:
+            consumer = self._injected_consumer or self._build_consumer()
+            try:
+                await consumer.start()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._connected = False
+                logger.warning(
+                    "Kafka no disponible (%s); reintento en %.1fs: %s",
+                    self._bootstrap_servers,
+                    delay,
+                    type(error).__name__,
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await consumer.stop()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._retry_max_seconds)
+                continue
+
+            self._consumer = consumer
+            self._connected = True
+            delay = self._retry_initial_seconds
+            try:
+                async for message in consumer:
+                    await self.process_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("el consumer de %s terminó inesperadamente", self._topic)
+                self._connected = False
+                self._consumer = None
+                with contextlib.suppress(Exception):
+                    await consumer.stop()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self._retry_max_seconds)
+                continue
+
+            self._connected = False
+            return
 
     async def process_message(self, message: Any) -> None:
         """Resuelve un mensaje y confirma el offset solo si quedó resuelto.
@@ -184,6 +229,7 @@ class KafkaSummaryConsumer:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        self._connected = False
         if self._consumer is not None:
             consumer, self._consumer = self._consumer, None
             try:

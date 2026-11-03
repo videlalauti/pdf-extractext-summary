@@ -5,16 +5,15 @@ from collections.abc import Callable, Iterator
 import pytest
 from fakes import (
     DEFAULT_CONTENT,
-    FakeKafkaConsumer,
     FakeLlmClient,
     FakeSummaryCache,
+    FakeSummaryConsumer,
     document_client,
 )
 from fastapi.testclient import TestClient
 
 import main
 from cache import NoopSummaryCache
-from consumer import KafkaSummaryConsumer
 from main import app
 from routes import get_document_client, get_llm_client, get_summary_cache
 
@@ -42,6 +41,7 @@ def build_client() -> Iterator[Callable[..., TestClient]]:
         llm_client: FakeLlmClient | None = None,
         content: str = DEFAULT_CONTENT,
         cache: FakeSummaryCache | NoopSummaryCache | None = None,
+        consumer: FakeSummaryConsumer | None = None,
     ) -> TestClient:
         fake_llm = llm_client if llm_client is not None else FakeLlmClient()
         persistence = document_client(content)
@@ -49,12 +49,12 @@ def build_client() -> Iterator[Callable[..., TestClient]]:
         app.dependency_overrides[get_llm_client] = lambda: fake_llm
         app.dependency_overrides[get_document_client] = lambda: persistence
         app.dependency_overrides[get_summary_cache] = lambda: fake_cache
+        main.build_summary_consumer = lambda summary_service: (
+            consumer if consumer is not None else FakeSummaryConsumer()
+        )
         return TestClient(app)
 
     original_factory = main.build_summary_consumer
-    main.build_summary_consumer = lambda summary_service: KafkaSummaryConsumer(
-        summary_service, "kafka:9092", consumer=FakeKafkaConsumer()
-    )
     try:
         yield build
     finally:

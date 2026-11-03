@@ -110,6 +110,9 @@ def build_consumer(
         # Por defecto llega un único evento: los tests de flujo solo necesitan
         # un documento encolado por extraction.
         consumer=kafka if kafka is not None else FakeKafkaConsumer([event_message()]),
+        # Backoff corto: los tests no esperan los 1s/30s de producción.
+        retry_initial_seconds=0.01,
+        retry_max_seconds=0.05,
     )
 
 
@@ -219,15 +222,52 @@ def test_el_estado_pasa_por_processing_mientras_genera():
     assert final == JOB_STATE_DONE
 
 
-def test_start_sin_broker_no_tumba_al_servicio():
-    kafka = FakeKafkaConsumer(start_error=RuntimeError("connection refused"))
+def test_start_reintenta_cuando_el_broker_no_esta_disponible():
+    """Fail-open + reconexión: no levanta y sigue intentando con backoff."""
+    kafka = FakeKafkaConsumer(start_errors=[RuntimeError("connection refused")] * 10)
     consumer = build_consumer(kafka=kafka)
 
     async def scenario():
         await consumer.start()
-        return consumer._task
+        await asyncio.sleep(0.05)
+        attempts = kafka.start_attempts
+        connected = consumer.is_connected
+        await consumer.stop()
+        return attempts, connected
 
-    assert asyncio.run(scenario()) is None
+    attempts, connected = asyncio.run(scenario())
+
+    assert attempts >= 2
+    assert connected is False
+
+
+def test_start_conecta_cuando_el_broker_vuelve():
+    class WaitingKafkaConsumer(FakeKafkaConsumer):
+        async def _stream(self):
+            while True:
+                await asyncio.sleep(0.01)
+                if False:  # marca la función como async generator sin emitir mensajes
+                    yield
+
+    kafka = WaitingKafkaConsumer(start_errors=[RuntimeError("connection refused")])
+    consumer = build_consumer(kafka=kafka)
+
+    async def scenario():
+        await consumer.start()
+        for _ in range(100):
+            if consumer.is_connected:
+                break
+            await asyncio.sleep(0.01)
+        connected = consumer.is_connected
+        running = consumer.is_running
+        await consumer.stop()
+        return connected, running
+
+    connected, running = asyncio.run(scenario())
+
+    assert kafka.start_attempts == 2
+    assert connected is True
+    assert running is True
 
 
 def test_stop_cancela_el_loop_y_cierra_el_consumer():

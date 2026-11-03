@@ -67,15 +67,17 @@ class FakeSummaryCache:
 class FakeKafkaConsumer:
     """Doble de AIOKafkaConsumer: registra commits y simula fallos de arranque."""
 
-    def __init__(self, messages=(), *, start_error: Exception | None = None) -> None:
+    def __init__(self, messages=(), *, start_errors: list[Exception] | None = None) -> None:
         self.messages = list(messages)
-        self.start_error = start_error
+        self.start_errors = list(start_errors or [])
+        self.start_attempts = 0
         self.commits = 0
         self.stopped = False
 
     async def start(self) -> None:
-        if self.start_error is not None:
-            raise self.start_error
+        self.start_attempts += 1
+        if self.start_errors:
+            raise self.start_errors.pop(0)
 
     async def commit(self) -> None:
         self.commits += 1
@@ -89,6 +91,25 @@ class FakeKafkaConsumer:
     async def _stream(self):
         for message in self.messages:
             yield message
+
+
+class FakeSummaryConsumer:
+    """Doble del consumer para el lifespan: estado de conexión controlable."""
+
+    def __init__(self, *, connected: bool = True) -> None:
+        self.connected = connected
+        self.started = False
+        self.stopped = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
 
 
 def document_client(

@@ -45,21 +45,24 @@ Ver `.env.example` para un ejemplo.
 ## Resumen asíncrono
 
 `POST /summary/{document_id}` y `GET /summary/{document_id}` comparten la misma clave en Redis
-(`summary:{document_id}`, con TTL) como estado y caché del resumen. El trigger del trabajo no es
-el request: es el consumer de Kafka (`KafkaSummaryConsumer`, corriendo en el lifespan), que
-cuando recibe el evento `documents.extracted` publicado por extraction resume el documento
-(fetch desde persistence, recorte, Ollama) y guarda el resultado en esa misma clave.
+(`summary:{document_id}`, con TTL) como estado y caché del resumen. El trigger automático es el
+consumer de Kafka (`KafkaSummaryConsumer`, corriendo en el lifespan), que cuando recibe el evento
+`documents.extracted` publicado por extraction resume el documento (fetch desde persistence,
+recorte, Ollama) y guarda el resultado en esa misma clave. Además, `POST` agenda el mismo trabajo
+en `BackgroundTasks` como red de seguridad: si el evento se perdió, el pedido explícito no queda
+en `queued` para siempre.
 
-- **Miss**: `POST` responde `202 {"status": "queued"}` y deja el estado en Redis; el consumer
-  hace el resumen cuando toma el evento. Un segundo `POST` responde `202` con el estado actual;
-  si el resumen ya terminó, responde `200` al instante sin volver a inferir.
+- **Miss**: `POST` responde `202 {"status": "queued"}` y deja el estado en Redis mientras agenda
+  el resumen en background. Un segundo `POST` sobre un job `queued` vuelve a dispararlo; si el
+  resumen ya terminó, responde `200` al instante sin volver a inferir.
 - **`GET`** devuelve `200 {summary, document_id}` si terminó, `202 {"status": "processing"}` si
   está corriendo, y `404` si nunca se pidió.
 - **At-least-once + idempotencia**: el offset se confirma después de procesar, no antes; si el
   proceso se cae, los eventos sin confirmar se reprocesan al reiniciar y el chequeo de caché
-  evita dobles resúmenes.
-- **Fail-open**: si el broker de Kafka no responde al arrancar, el servicio levanta igual sin
-  consumer (log de warning); la caché nunca provoca un 5xx.
+  evita dobles resúmenes. Un lock por documento comparte la decisión entre el consumer y el
+  background del POST.
+- **Fail-open + reconexión**: si el broker de Kafka no responde al arrancar, el servicio levanta
+  igual y reintenta con backoff exponencial hasta que vuelve; la caché nunca provoca un 5xx.
 
 ## Integración en el compose
 
@@ -87,11 +90,12 @@ ports:
 | --- | --- |
 | Documento inexistente | `404` en `GET` si nunca se pidió |
 | Redis caído | Fail-open: `POST` sigue respondiendo `202`; `GET` puede responder `404` |
-| Broker de Kafka caído | El servicio levanta sin consumer (warning); no hay resúmenes nuevos hasta reiniciar |
+| Broker de Kafka caído | El servicio levanta igual y reintenta solo con backoff; `POST` sigue pudiendo disparar el resumen |
 | Ollama caído, timeout o error de dominio durante el resumen | El consumer loguea el error, no confirma el offset y sigue con el próximo evento |
 
-`/health` responde `200` solo si Ollama responde a `GET /api/tags` (timeout corto, ~3 s);
-si no, responde `503` con `"status": "unhealthy"`.
+`/health` responde `200` solo si Ollama responde a `GET /api/tags` (timeout corto, ~3 s) **y** el
+consumer de Kafka está conectado. En cualquier otro caso responde `503` con `"status":
+"unhealthy"`, indicando `ollama` y `kafka` por separado.
 
 ## Diseño interno
 
@@ -100,8 +104,9 @@ si no, responde `503` con `"status": "unhealthy"`.
 - `cache.py`: puerto `SummaryCache` (Protocol, `get`/`set`), `NoopSummaryCache` y
   `RedisSummaryCache` (clave única con TTL y fail-open); mismo patrón que `llm.py`.
 - `consumer.py`: `KafkaSummaryConsumer`, que consume `documents.extracted` en el lifespan,
-  dispara `SummaryService.process` por evento y confirma el offset solo después de resolverlo
-  (at-least-once + idempotencia); el adaptador aiokafka se inyecta en los tests.
+  reconecta solo con backoff si Kafka se cae, dispara `SummaryService.process` por evento y
+  confirma el offset solo después de resolverlo (at-least-once + idempotencia); el adaptador
+  aiokafka se inyecta en los tests.
 - `app.py`: `SummaryService` (obtener documento → recortar a inicio + final → resumir), el
   estado del job y `Settings`.
 - `routes.py`: endpoints que resuelven las dependencias con `Depends`; los tests inyectan un

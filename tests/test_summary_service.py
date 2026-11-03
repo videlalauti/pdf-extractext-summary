@@ -4,7 +4,7 @@ import asyncio
 import json
 
 import pytest
-from fakes import FakeLlmClient, FakeSummaryCache, document_client
+from fakes import FakeLlmClient, FakeSummaryCache, FakeSummaryConsumer, document_client
 from pydantic import ValidationError
 
 from app import (
@@ -26,7 +26,7 @@ def _seed(cache: FakeSummaryCache, document_id: str, status: str, summary: str |
     cache.data[f"summary:{document_id}"] = json.dumps(job)
 
 
-def test_health_healthy_cuando_ollama_responde(build_client):
+def test_health_healthy_cuando_ollama_y_kafka_responden(build_client):
     with build_client(llm_client=FakeLlmClient(available=True)) as client:
         response = client.get("/health")
 
@@ -35,6 +35,7 @@ def test_health_healthy_cuando_ollama_responde(build_client):
         "status": "healthy",
         "service": "summary-service",
         "ollama": "reachable",
+        "kafka": "connected",
     }
 
 
@@ -43,7 +44,27 @@ def test_health_unhealthy_cuando_ollama_no_responde(build_client):
         response = client.get("/health")
 
     assert response.status_code == 503
-    assert response.json()["status"] == "unhealthy"
+    assert response.json() == {
+        "status": "unhealthy",
+        "service": "summary-service",
+        "ollama": "unreachable",
+        "kafka": "connected",
+    }
+
+
+def test_health_unhealthy_cuando_kafka_esta_desconectado(build_client):
+    consumer = FakeSummaryConsumer(connected=False)
+
+    with build_client(llm_client=FakeLlmClient(available=True), consumer=consumer) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "service": "summary-service",
+        "ollama": "reachable",
+        "kafka": "disconnected",
+    }
 
 
 def test_fake_del_puerto_cumple_el_protocolo():
