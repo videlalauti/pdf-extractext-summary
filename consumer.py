@@ -34,9 +34,12 @@ logger = logging.getLogger(__name__)
 
 DOCUMENTS_EXTRACTED_TOPIC = "documents.extracted"
 CONSUMER_GROUP_ID = "summary-service"
-# Timeout acotado: si Kafka está caído, fallar rápido en el arranque (fail-open)
-# en lugar de dejar el lifespan esperando el timeout por defecto.
-KAFKA_REQUEST_TIMEOUT_MS = 2000
+# Timeouts coherentes entre sí: request_timeout_ms debe ser mayor que
+# session_timeout_ms para no expulsar al consumer durante un rebalanceo o una
+# respuesta lenta del broker. El heartbeat va bien por debajo de la sesión.
+KAFKA_SESSION_TIMEOUT_MS = 10_000
+KAFKA_HEARTBEAT_INTERVAL_MS = 3_000
+KAFKA_REQUEST_TIMEOUT_MS = 30_000
 # Reintento del supervisor: 1s → 2s → 4s … con tope de 30s.
 CONSUMER_RETRY_INITIAL_SECONDS = 1.0
 CONSUMER_RETRY_MAX_SECONDS = 30.0
@@ -137,6 +140,8 @@ class KafkaSummaryConsumer:
             # publicados antes de que el consumer se suscriba no se pierden.
             auto_offset_reset="earliest",
             enable_auto_commit=False,
+            session_timeout_ms=KAFKA_SESSION_TIMEOUT_MS,
+            heartbeat_interval_ms=KAFKA_HEARTBEAT_INTERVAL_MS,
             request_timeout_ms=KAFKA_REQUEST_TIMEOUT_MS,
         )
 

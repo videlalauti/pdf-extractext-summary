@@ -349,6 +349,25 @@ def test_start_conecta_cuando_el_broker_vuelve():
     assert running is True
 
 
+def test_los_timeouts_de_kafka_son_coherentes(monkeypatch):
+    """request_timeout_ms >= session_timeout_ms evita expulsiones en rebalances."""
+    captured: dict = {}
+
+    def fake_consumer_factory(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeKafkaConsumer()
+
+    monkeypatch.setattr("consumer.AIOKafkaConsumer", fake_consumer_factory)
+    consumer = build_consumer()
+
+    consumer._build_consumer()
+
+    assert captured["session_timeout_ms"] == 10_000
+    assert captured["heartbeat_interval_ms"] == 3_000
+    assert captured["request_timeout_ms"] == 30_000
+    assert captured["request_timeout_ms"] >= captured["session_timeout_ms"]
+
+
 def test_stop_cancela_el_loop_y_cierra_el_consumer():
     class EndlessKafkaConsumer(FakeKafkaConsumer):
         async def _stream(self):
