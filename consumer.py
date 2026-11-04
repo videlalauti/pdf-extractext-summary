@@ -376,7 +376,7 @@ class KafkaSummaryConsumer:
             # Un commit posterior podría confirmar este mensaje de forma
             # acumulativa. Fallar el loop fuerza al supervisor a reconectar
             # desde el último offset confirmado por el broker.
-            logger.error("no se pudo confirmar %s offset=%d", tp, offset, exc_info=True)
+            logger.exception("no se pudo confirmar %s offset=%d", tp, offset)
             raise
 
     async def stop(self) -> None:
