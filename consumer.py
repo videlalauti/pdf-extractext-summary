@@ -373,8 +373,11 @@ class KafkaSummaryConsumer:
         try:
             await consumer.commit({tp: offset + 1})
         except Exception:
-            # No propagar: se reintenta en el próximo mensaje o al reiniciar.
-            logger.warning("no se pudo confirmar %s offset=%d", tp, offset, exc_info=True)
+            # Un commit posterior podría confirmar este mensaje de forma
+            # acumulativa. Fallar el loop fuerza al supervisor a reconectar
+            # desde el último offset confirmado por el broker.
+            logger.error("no se pudo confirmar %s offset=%d", tp, offset, exc_info=True)
+            raise
 
     async def stop(self) -> None:
         """Corta el loop y cierra la conexión (disposability: shutdown ordenado)."""
