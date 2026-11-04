@@ -42,26 +42,33 @@ class FakeLlmClient:
 class FakeSummaryCache:
     """Implementación en memoria de :class:`SummaryCache` que registra escrituras.
 
-    Con `fail_open=True` simula a Redis caído: `get` es miss y `set` devuelve
-    False para que el flujo degrade a síncrono.
+    Con `fail_open=True` simula a Redis caído: `get` es miss, `set` devuelve
+    False y `ping` devuelve False.
     """
 
     def __init__(self, *, fail_open: bool = False) -> None:
         self.fail_open = fail_open
         self.data: dict[str, str] = {}
         self.sets: list[tuple[str, str]] = []
+        self.set_calls: list[tuple[str, str, int | None]] = []
 
     async def get(self, key: str) -> str | None:
         if self.fail_open:
             return None
         return self.data.get(key)
 
-    async def set(self, key: str, value: str) -> bool:
+    async def set(
+        self, key: str, value: str, *, ttl_seconds: int | None = None
+    ) -> bool:
         if self.fail_open:
             return False
         self.sets.append((key, value))
+        self.set_calls.append((key, value, ttl_seconds))
         self.data[key] = value
         return True
+
+    async def ping(self) -> bool:
+        return not self.fail_open
 
 
 class FakeKafkaConsumer:

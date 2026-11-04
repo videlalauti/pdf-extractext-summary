@@ -21,21 +21,33 @@ class SummaryCache(Protocol):
 
     `get` devuelve None como miss (nada guardado o Redis caído; fail-open).
     `set` devuelve False cuando el valor no se pudo guardar (caché deshabilitada
-    o Redis caído) para que el llamador pueda degradar a resumen síncrono.
+    o Redis caído): sin estado persistible no se infiere, para no perder el
+    resultado ni duplicar intentos.
+    `ping` distingue un miss real de una caída: el consumer lo usa para no
+    quemar los 3 intentos de entrega mientras Redis no puede guardar nada.
     """
 
     async def get(self, key: str) -> str | None: ...
 
-    async def set(self, key: str, value: str) -> bool: ...
+    async def set(self, key: str, value: str, *, ttl_seconds: int | None = None) -> bool: ...
+
+    async def ping(self) -> bool: ...
 
 
 class NoopSummaryCache:
-    """Caché que no guarda nada: mantiene el flujo síncrono de siempre."""
+    """Caché que no guarda nada; el flujo asíncrono no puede persistir estado.
+
+    No es un modo degradado: los endpoints responden 503 y el consumer no se
+    arranca cuando la caché está deshabilitada por configuración.
+    """
 
     async def get(self, key: str) -> str | None:
         return None
 
-    async def set(self, key: str, value: str) -> bool:
+    async def set(self, key: str, value: str, *, ttl_seconds: int | None = None) -> bool:
+        return False
+
+    async def ping(self) -> bool:
         return False
 
 
@@ -69,15 +81,31 @@ class RedisSummaryCache:
             return None
         return raw.decode("utf-8") if raw is not None else None
 
-    async def set(self, key: str, value: str) -> bool:
+    async def set(
+        self, key: str, value: str, *, ttl_seconds: int | None = None
+    ) -> bool:
         if not self._enabled:
             return False
         try:
-            await self._client.set(key, value, ex=self._ttl_seconds)
+            await self._client.set(
+                key,
+                value,
+                ex=self._ttl_seconds if ttl_seconds is None else ttl_seconds,
+            )
         except (RedisError, OSError) as exc:
             logger.warning("Redis no disponible al escribir %s: %s", key, exc)
             return False
         return True
+
+    async def ping(self) -> bool:
+        """True si Redis responde; False si está deshabilitado o caído."""
+        if not self._enabled:
+            return False
+        try:
+            return bool(await self._client.ping())
+        except (RedisError, OSError) as exc:
+            logger.warning("Redis no disponible al hacer ping: %s", exc)
+            return False
 
     async def aclose(self) -> None:
         if self._owns_client:

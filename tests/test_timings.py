@@ -8,7 +8,7 @@ import re
 import httpx
 from fakes import DEFAULT_CONTENT, FakeLlmClient, FakeSummaryCache
 
-from app import JOB_STATE_PROCESSING, build_summary_service, settings
+from app import JOB_STATE_QUEUED, build_summary_service, settings
 from errors import LlmTimeoutError
 
 COMPLETED_PATTERN = re.compile(
@@ -94,7 +94,7 @@ def test_loguea_los_tiempos_cuando_ollama_timeoutea(caplog):
     assert error == "LlmTimeoutError"
     assert failed[0].exc_info is not None
     assert _records(caplog, "resumen completado") == []
-    assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_PROCESSING
+    assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_QUEUED
 
 
 def test_loguea_el_fetch_fallido_con_ollama_en_cero(caplog):

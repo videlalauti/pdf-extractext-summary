@@ -20,6 +20,9 @@ class InMemoryRedisClient:
         self.data[key] = value.encode()
         return True
 
+    async def ping(self) -> bool:
+        return True
+
 
 class BrokenRedisClient:
     """Simula a Redis caído: cada operación lanza un error de conexión."""
@@ -28,6 +31,9 @@ class BrokenRedisClient:
         raise ConnectionError("redis caído")
 
     async def set(self, key: str, value: str, **kwargs) -> bool:
+        raise ConnectionError("redis caído")
+
+    async def ping(self) -> bool:
         raise ConnectionError("redis caído")
 
 
@@ -47,6 +53,7 @@ async def test_noop_siempre_reporta_miss_y_falla_el_set():
 
     assert await cache.get("summary:doc-1") is None
     assert await cache.set("summary:doc-1", '{"status":"done"}') is False
+    assert await cache.ping() is False
 
 
 @pytest.mark.anyio
@@ -59,6 +66,45 @@ async def test_redis_cache_guarda_y_devuelve_con_ttl():
     assert await cache.set("summary:doc-1", '{"status":"done"}') is True
     assert await cache.get("summary:doc-1") == '{"status":"done"}'
     assert client.set_kwargs[0][2] == {"ex": 300}
+
+
+@pytest.mark.anyio
+async def test_redis_cache_permite_ttl_por_escritura():
+    """Terminales y no terminales usan TTLs distintos sobre la misma clave."""
+    client = InMemoryRedisClient()
+    cache = RedisSummaryCache(
+        "redis://fake:6379/0", ttl_seconds=300, enabled=True, client=client
+    )
+
+    assert (
+        await cache.set(
+            "summary:doc-1", '{"status":"done"}', ttl_seconds=604800
+        )
+        is True
+    )
+    assert client.set_kwargs[0][2] == {"ex": 604800}
+
+
+@pytest.mark.anyio
+async def test_redis_cache_ping_refleja_el_estado_de_redis():
+    assert (
+        await RedisSummaryCache(
+            "redis://fake:6379/0", ttl_seconds=300, enabled=True, client=InMemoryRedisClient()
+        ).ping()
+        is True
+    )
+    assert (
+        await RedisSummaryCache(
+            "redis://fake:6379/0", ttl_seconds=300, enabled=True, client=BrokenRedisClient()
+        ).ping()
+        is False
+    )
+    assert (
+        await RedisSummaryCache(
+            "redis://fake:6379/0", ttl_seconds=300, enabled=False, client=InMemoryRedisClient()
+        ).ping()
+        is False
+    )
 
 
 @pytest.mark.anyio

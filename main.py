@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from shared.web.cors import add_cors
 from shared.web.logging import RequestIdMiddleware, TimingMiddleware, setup_logging
 
-from app import SummaryService, build_summary_service, settings
+from app import Settings, SummaryService, build_summary_service, settings
 from cache import RedisSummaryCache
 from consumer import KafkaSummaryConsumer
 from error_handlers import register_error_handlers
@@ -17,6 +17,20 @@ from llm import OllamaLlmClient
 from routes import router
 
 SERVICE_NAME = "summary-service"
+
+
+def validate_runtime_settings(config: Settings) -> None:
+    """Rechaza configuraciones no soportadas antes de levantar la app.
+
+    Sin caché no hay estado persistible: los endpoints responderían 503 y el
+    consumer esperaría 30 × 10s por mensaje. Es un modo no soportado, no un
+    modo degradado, así que falla el startup y el contenedor queda unhealthy.
+    """
+    if not config.summary_cache_enabled:
+        raise RuntimeError(
+            "SUMMARY_CACHE_ENABLED=false no está soportado: el estado del job "
+            "requiere Redis"
+        )
 
 
 def build_summary_consumer(summary_service: SummaryService) -> KafkaSummaryConsumer:
@@ -27,6 +41,7 @@ def build_summary_consumer(summary_service: SummaryService) -> KafkaSummaryConsu
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        validate_runtime_settings(settings)
         document_client = httpx.AsyncClient(timeout=settings.persistence_timeout_seconds)
         llm_client = OllamaLlmClient(
             base_url=settings.ollama_url, timeout=settings.ollama_timeout_seconds

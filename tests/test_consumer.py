@@ -32,7 +32,9 @@ from shared.web.logging import (
 
 from app import (
     JOB_STATE_DONE,
+    JOB_STATE_FAILED,
     JOB_STATE_PROCESSING,
+    JOB_STATE_QUEUED,
     Settings,
     build_summary_service,
     settings,
@@ -129,6 +131,9 @@ def build_consumer(
         # Reintento del mensaje fallido sin esperas reales.
         message_retry_initial_seconds=0.0,
         message_retry_max_seconds=0.0,
+        # Espera del guard de caché sin sleeps reales.
+        cache_retry_seconds=0.0,
+        max_cache_wait_attempts=3,
     )
 
 
@@ -153,10 +158,11 @@ def test_procesa_el_evento_y_guarda_el_resumen_en_cache():
     asyncio.run(_consume_all(consumer))
 
     assert llm.models == [settings.ollama_model]
-    assert json.loads(cache.data["summary:doc-1"]) == {
-        "status": JOB_STATE_DONE,
-        "summary": "resumen de prueba",
-    }
+    job = json.loads(cache.data["summary:doc-1"])
+    assert job["status"] == JOB_STATE_DONE
+    assert job["summary"] == "resumen de prueba"
+    assert job["attempts"] == 1
+    assert job["updated_at"]
     assert kafka.commits == 1
 
 
@@ -189,8 +195,10 @@ def test_un_fallo_de_llm_no_confirma_offset_ni_tumba_al_consumer():
 
     asyncio.run(_consume_all(consumer))
 
-    assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_PROCESSING
-    assert json.loads(cache.data["summary:doc-2"])["status"] == JOB_STATE_PROCESSING
+    assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_QUEUED
+    assert json.loads(cache.data["summary:doc-1"])["attempts"] == 1
+    assert json.loads(cache.data["summary:doc-2"])["status"] == JOB_STATE_QUEUED
+    assert json.loads(cache.data["summary:doc-2"])["attempts"] == 1
     assert kafka.commits == 0
     assert kafka.commit_offsets == []
 
@@ -233,8 +241,9 @@ def test_un_mensaje_fallido_no_queda_confirmado_por_el_siguiente():
 def test_un_mensaje_que_falla_tres_veces_se_descarta_controladamente(caplog):
     """Tras el tope se confirma para no atorar la partición, con log ERROR."""
     llm = FakeLlmClient(error=LlmTimeoutError())
+    cache = FakeSummaryCache()
     kafka = FakeKafkaConsumer([event_message("doc-1", offset=0)] * 3)
-    consumer = build_consumer(llm=llm, kafka=kafka)
+    consumer = build_consumer(llm=llm, cache=cache, kafka=kafka)
     caplog.set_level(logging.ERROR)
 
     asyncio.run(_consume_all(consumer))
@@ -243,6 +252,49 @@ def test_un_mensaje_que_falla_tres_veces_se_descarta_controladamente(caplog):
     assert len(kafka.seeks) == 2
     assert kafka.commit_offsets == [{tp: 1}]
     assert "mensaje descartado tras 3 intentos" in caplog.text
+    job = json.loads(cache.data["summary:doc-1"])
+    assert job["status"] == JOB_STATE_FAILED
+    assert job["attempts"] == 3
+    assert job["reason"] == "LlmTimeoutError"
+
+
+def test_un_job_failed_es_terminal_y_se_confirma_sin_reintentar():
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    cache.data["summary:doc-1"] = json.dumps(
+        {
+            "status": JOB_STATE_FAILED,
+            "attempts": 3,
+            "reason": "empty_document",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+    kafka = FakeKafkaConsumer([event_message()])
+    consumer = build_consumer(llm=llm, cache=cache, kafka=kafka)
+
+    asyncio.run(_consume_all(consumer))
+
+    assert llm.prompts == []
+    assert kafka.commits == 1
+
+
+def test_cache_unavailable_no_cuenta_entregas_y_usa_log_distinto(caplog):
+    llm = FakeLlmClient()
+    kafka = FakeKafkaConsumer([event_message("doc-1")] * 3)
+    consumer = build_consumer(
+        llm=llm, cache=FakeSummaryCache(fail_open=True), kafka=kafka
+    )
+    caplog.set_level(logging.WARNING)
+
+    asyncio.run(_consume_all(consumer))
+
+    tp = TopicPartition(DOCUMENTS_EXTRACTED_TOPIC, 0)
+    assert llm.prompts == []
+    assert kafka.seeks == [(tp, 0), (tp, 0)]
+    assert kafka.commit_offsets == [{tp: 1}]
+    assert "cache_unavailable" in caplog.text
+    assert "mensaje descartado tras" not in caplog.text
+    assert "mensaje descartado: cache_unavailable" in caplog.text
 
 
 def test_documento_inexistente_no_confirma_el_offset():

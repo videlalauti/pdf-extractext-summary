@@ -6,7 +6,9 @@ from fastapi.responses import JSONResponse
 
 from app import (
     JOB_STATE_DONE,
+    JOB_STATE_FAILED,
     JOB_STATE_QUEUED,
+    MAX_ATTEMPTS_REASON,
     Settings,
     SummaryResponse,
     SummaryService,
@@ -70,12 +72,14 @@ async def submit_summary(
         if job.status == JOB_STATE_QUEUED:
             background.add_task(service.process, document_id)
         return JSONResponse(
-            status_code=status.HTTP_202_ACCEPTED, content={"status": job.status}
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"status": job.status, "attempts": job.attempts},
         )
     await service.enqueue(document_id)
     background.add_task(service.process, document_id)
     return JSONResponse(
-        status_code=status.HTTP_202_ACCEPTED, content={"status": JOB_STATE_QUEUED}
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"status": JOB_STATE_QUEUED, "attempts": 0},
     )
 
 
@@ -87,9 +91,21 @@ async def get_summary(
     job = await service.peek_job(document_id)
     if job is not None and job.status == JOB_STATE_DONE:
         return SummaryResponse(summary=job.summary or "", document_id=document_id)
+    if job is not None and job.status == JOB_STATE_FAILED:
+        # 409 (no 200) para que 200 siga significando "resumen listo" y el
+        # cliente no confunda un fallo terminal con un resultado.
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "status": JOB_STATE_FAILED,
+                "attempts": job.attempts,
+                "reason": job.reason or MAX_ATTEMPTS_REASON,
+            },
+        )
     if job is not None:
         return JSONResponse(
-            status_code=status.HTTP_202_ACCEPTED, content={"status": job.status}
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"status": job.status, "attempts": job.attempts},
         )
     raise DocumentNotFoundError
 
@@ -99,16 +115,19 @@ async def health(
     response: Response,
     llm_client: LlmClient = Depends(get_llm_client),
     summary_consumer: KafkaSummaryConsumer = Depends(get_summary_consumer),
+    summary_cache: SummaryCache = Depends(get_summary_cache),
 ) -> dict:
-    """Estado real del servicio: Ollama y el consumer de Kafka, no solo uno."""
+    """Estado real del servicio: Ollama, Kafka y el estado persistible (Redis)."""
     ollama_ok = await llm_client.is_available()
     kafka_ok = summary_consumer.is_connected
+    redis_ok = await summary_cache.ping()
     body = {
-        "status": "healthy" if ollama_ok and kafka_ok else "unhealthy",
+        "status": "healthy" if ollama_ok and kafka_ok and redis_ok else "unhealthy",
         "service": "summary-service",
         "ollama": "reachable" if ollama_ok else "unreachable",
         "kafka": "connected" if kafka_ok else "disconnected",
+        "redis": "ok" if redis_ok else "down",
     }
-    if not ollama_ok or not kafka_ok:
+    if not ollama_ok or not kafka_ok or not redis_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return body

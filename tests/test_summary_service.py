@@ -9,25 +9,48 @@ from pydantic import ValidationError
 
 from app import (
     JOB_STATE_DONE,
+    JOB_STATE_FAILED,
     JOB_STATE_PROCESSING,
     JOB_STATE_QUEUED,
+    MAX_SUMMARY_ATTEMPTS,
     Settings,
     build_summary_service,
+    parse_job,
+    serialize_job,
     settings,
+    utc_now_iso,
 )
+from errors import LlmTimeoutError
 from llm import LlmClient
 
 
-def _seed(cache: FakeSummaryCache, document_id: str, status: str, summary: str | None = None):
+def _seed(
+    cache: FakeSummaryCache,
+    document_id: str,
+    status: str,
+    summary: str | None = None,
+    *,
+    attempts: int = 0,
+    updated_at: str | None = None,
+    reason: str | None = None,
+):
     """Deja un estado de job en la caché, como lo dejaría el consumer."""
-    job = {"status": status}
+    job = {
+        "status": status,
+        "attempts": attempts,
+        "updated_at": updated_at or utc_now_iso(),
+    }
     if summary is not None:
         job["summary"] = summary
+    if reason is not None:
+        job["reason"] = reason
     cache.data[f"summary:{document_id}"] = json.dumps(job)
 
 
 def test_health_healthy_cuando_ollama_y_kafka_responden(build_client):
-    with build_client(llm_client=FakeLlmClient(available=True)) as client:
+    with build_client(
+        llm_client=FakeLlmClient(available=True), cache=FakeSummaryCache()
+    ) as client:
         response = client.get("/health")
 
     assert response.status_code == 200
@@ -36,11 +59,14 @@ def test_health_healthy_cuando_ollama_y_kafka_responden(build_client):
         "service": "summary-service",
         "ollama": "reachable",
         "kafka": "connected",
+        "redis": "ok",
     }
 
 
 def test_health_unhealthy_cuando_ollama_no_responde(build_client):
-    with build_client(llm_client=FakeLlmClient(available=False)) as client:
+    with build_client(
+        llm_client=FakeLlmClient(available=False), cache=FakeSummaryCache()
+    ) as client:
         response = client.get("/health")
 
     assert response.status_code == 503
@@ -49,13 +75,18 @@ def test_health_unhealthy_cuando_ollama_no_responde(build_client):
         "service": "summary-service",
         "ollama": "unreachable",
         "kafka": "connected",
+        "redis": "ok",
     }
 
 
 def test_health_unhealthy_cuando_kafka_esta_desconectado(build_client):
     consumer = FakeSummaryConsumer(connected=False)
 
-    with build_client(llm_client=FakeLlmClient(available=True), consumer=consumer) as client:
+    with build_client(
+        llm_client=FakeLlmClient(available=True),
+        consumer=consumer,
+        cache=FakeSummaryCache(),
+    ) as client:
         response = client.get("/health")
 
     assert response.status_code == 503
@@ -64,6 +95,24 @@ def test_health_unhealthy_cuando_kafka_esta_desconectado(build_client):
         "service": "summary-service",
         "ollama": "reachable",
         "kafka": "disconnected",
+        "redis": "ok",
+    }
+
+
+def test_health_unhealthy_cuando_redis_esta_caido(build_client):
+    with build_client(
+        llm_client=FakeLlmClient(available=True),
+        cache=FakeSummaryCache(fail_open=True),
+    ) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "service": "summary-service",
+        "ollama": "reachable",
+        "kafka": "connected",
+        "redis": "down",
     }
 
 
@@ -76,6 +125,13 @@ def test_el_tope_de_contexto_tiene_que_permitir_mitad_y_mitad():
         Settings(max_summary_chars=1)
 
 
+def test_cache_deshabilitada_falla_el_startup():
+    from main import validate_runtime_settings
+
+    with pytest.raises(RuntimeError, match="SUMMARY_CACHE_ENABLED=false"):
+        validate_runtime_settings(Settings(summary_cache_enabled=False))
+
+
 # --------------------------------------------------------------------------- #
 # POST: acepta el trabajo; el trigger es el consumer de Kafka
 # --------------------------------------------------------------------------- #
@@ -86,7 +142,7 @@ def test_post_responde_202_queued_cuando_no_hay_resumen(build_client):
         response = client.post("/summary/doc-1")
 
     assert response.status_code == 202
-    assert response.json() == {"status": JOB_STATE_QUEUED}
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 0}
 
 
 def test_post_dispara_el_procesamiento_aunque_no_llegue_el_evento(build_client):
@@ -98,7 +154,7 @@ def test_post_dispara_el_procesamiento_aunque_no_llegue_el_evento(build_client):
         response = client.post("/summary/doc-1")
 
     assert response.status_code == 202
-    assert response.json() == {"status": JOB_STATE_QUEUED}
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 0}
     assert len(llm.prompts) == 1
     assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_DONE
 
@@ -113,7 +169,7 @@ def test_post_con_job_queued_reintenta_el_procesamiento(build_client):
         response = client.post("/summary/doc-1")
 
     assert response.status_code == 202
-    assert response.json() == {"status": JOB_STATE_QUEUED}
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 0}
     assert len(llm.prompts) == 1
 
 
@@ -150,7 +206,7 @@ def test_post_devuelve_202_con_el_estado_actual_si_esta_en_curso(build_client):
         response = client.post("/summary/doc-1")
 
     assert response.status_code == 202
-    assert response.json() == {"status": JOB_STATE_PROCESSING}
+    assert response.json() == {"status": JOB_STATE_PROCESSING, "attempts": 0}
 
 
 def test_post_responde_202_aun_con_redis_caido(build_client):
@@ -185,7 +241,28 @@ def test_get_devuelve_202_mientras_el_consumer_procesa(build_client):
         response = client.get("/summary/doc-1")
 
     assert response.status_code == 202
-    assert response.json() == {"status": JOB_STATE_PROCESSING}
+    assert response.json() == {"status": JOB_STATE_PROCESSING, "attempts": 0}
+
+
+def test_get_devuelve_409_con_failed_attempts_y_reason(build_client):
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_FAILED,
+        attempts=MAX_SUMMARY_ATTEMPTS,
+        reason="LlmTimeoutError",
+    )
+
+    with build_client(cache=cache) as client:
+        response = client.get("/summary/doc-1")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "status": JOB_STATE_FAILED,
+        "attempts": MAX_SUMMARY_ATTEMPTS,
+        "reason": "LlmTimeoutError",
+    }
 
 
 def test_get_devuelve_200_tras_el_post_que_dispara_el_resumen(build_client):
@@ -209,9 +286,9 @@ def test_get_sin_resumen_devuelve_404(build_client):
 # --------------------------------------------------------------------------- #
 
 
-def _service(llm: FakeLlmClient, cache: FakeSummaryCache):
+def _service(llm: FakeLlmClient, cache: FakeSummaryCache, *, content: str = "texto de prueba"):
     return build_summary_service(
-        document_client=document_client(),
+        document_client=document_client(content),
         llm_client=llm,
         cache=cache,
         config=settings,
@@ -245,3 +322,120 @@ def test_consumer_y_background_comparten_el_lock_por_documento():
     assert asyncio.run(scenario()) == [True, True]
     assert len(llm.prompts) == 1
     assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_DONE
+
+
+def test_los_defaults_nuevos_son_los_documentados():
+    config = Settings()
+
+    assert config.summary_result_ttl_seconds == 604800
+
+
+def test_un_fallo_deja_queued_con_attempts_y_el_tercero_failed():
+    llm = FakeLlmClient(error=LlmTimeoutError())
+    cache = FakeSummaryCache()
+    service = _service(llm, cache)
+
+    async def scenario():
+        return [await service.process("doc-1") for _ in range(MAX_SUMMARY_ATTEMPTS)]
+
+    assert asyncio.run(scenario()) == [False, False, False]
+
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_FAILED
+    assert job.attempts == MAX_SUMMARY_ATTEMPTS
+    assert job.reason == "LlmTimeoutError"
+    assert len(llm.prompts) == MAX_SUMMARY_ATTEMPTS
+
+
+def test_empty_document_es_terminal_en_el_primer_intento():
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    service = _service(llm, cache, content="   ")
+
+    assert asyncio.run(service.process("doc-1")) is True
+
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_FAILED
+    assert job.attempts == 1
+    assert job.reason == "empty_document"
+    assert llm.prompts == []
+
+
+def test_process_no_reintenta_un_failed_terminal():
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_FAILED,
+        attempts=MAX_SUMMARY_ATTEMPTS,
+        reason="LlmTimeoutError",
+    )
+
+    assert asyncio.run(_service(llm, cache).process("doc-1")) is True
+
+    assert llm.prompts == []
+    assert json.loads(cache.data["summary:doc-1"])["status"] == JOB_STATE_FAILED
+
+
+def test_el_resultado_done_usa_el_ttl_largo():
+    cache = FakeSummaryCache()
+
+    asyncio.run(_service(FakeLlmClient(), cache).process("doc-1"))
+
+    _, raw, ttl = cache.set_calls[-1]
+    assert parse_job(raw).status == JOB_STATE_DONE
+    assert ttl == settings.summary_result_ttl_seconds
+
+
+def test_los_estados_no_terminales_usan_el_ttl_corto():
+    cache = FakeSummaryCache()
+
+    asyncio.run(
+        _service(FakeLlmClient(error=LlmTimeoutError()), cache).process("doc-1")
+    )
+
+    _, raw, ttl = cache.set_calls[-1]
+    assert parse_job(raw).status == JOB_STATE_QUEUED
+    assert ttl == settings.summary_cache_ttl_seconds
+
+
+def test_parse_job_acepta_el_esquema_viejo_y_descarta_corruptos():
+    legacy = parse_job('{"status":"done","summary":"viejo"}')
+
+    assert legacy is not None
+    assert legacy.status == JOB_STATE_DONE
+    assert legacy.attempts == 0
+    assert legacy.updated_at.startswith("1970-01-01")
+    assert parse_job("no es json") is None
+    assert parse_job('{"status":"desconocido"}') is None
+
+
+def test_serialize_job_omite_los_campos_opcionales_vacios():
+    raw = serialize_job(JOB_STATE_QUEUED, attempts=2)
+
+    assert json.loads(raw) == {
+        "status": JOB_STATE_QUEUED,
+        "attempts": 2,
+        "updated_at": json.loads(raw)["updated_at"],
+    }
+
+
+def test_el_reason_no_incluye_el_mensaje_del_error():
+    llm = FakeLlmClient(error=RuntimeError("falló contra http://ollama:11434"))
+    cache = FakeSummaryCache()
+    service = _service(llm, cache)
+
+    async def scenario():
+        for _ in range(MAX_SUMMARY_ATTEMPTS):
+            await service.process("doc-1")
+
+    asyncio.run(scenario())
+
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_FAILED
+    assert job.reason == "RuntimeError"
+    assert "http://" not in cache.data["summary:doc-1"]

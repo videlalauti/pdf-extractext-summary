@@ -1,10 +1,12 @@
 """Summary service: capa de aplicación, orquestación con persistence y Ollama."""
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Literal
 
 import httpx
 from pydantic import BaseModel, Field
@@ -14,6 +16,7 @@ from shared.web.logging import request_id_header
 from cache import NoopSummaryCache, SummaryCache
 from errors import (
     DocumentNotFoundError,
+    EmptyDocumentError,
     PersistenceUnavailableError,
 )
 from llm import LlmClient
@@ -23,6 +26,26 @@ logger = logging.getLogger(__name__)
 JOB_STATE_QUEUED = "queued"
 JOB_STATE_PROCESSING = "processing"
 JOB_STATE_DONE = "done"
+JOB_STATE_FAILED = "failed"
+TERMINAL_JOB_STATES = frozenset({JOB_STATE_DONE, JOB_STATE_FAILED})
+JOB_STATES = frozenset(
+    {JOB_STATE_QUEUED, JOB_STATE_PROCESSING, JOB_STATE_DONE, JOB_STATE_FAILED}
+)
+# Tope de intentos iniciados por job. Es la única fuente del límite: el consumer
+# usa el mismo valor para decidir cuándo descartar una entrega.
+MAX_SUMMARY_ATTEMPTS = 3
+MAX_ATTEMPTS_REASON = "max_attempts_exhausted"
+SUMMARY_KEY_PREFIX = "summary:"
+# Un job sin updated_at (esquema viejo) se considera viejo y reconciliable.
+LEGACY_UPDATED_AT = "1970-01-01T00:00:00+00:00"
+
+
+class EnqueueResult(str, Enum):
+    """Resultado de encolar: distingue un job done de un fallo de persistencia."""
+
+    QUEUED = "queued"
+    DONE = "done"
+    UNAVAILABLE = "unavailable"
 
 # Locks por documento compartidos por todo el proceso: el consumer de Kafka y
 # el BackgroundTask del POST usan instancias distintas de SummaryService, así
@@ -61,7 +84,11 @@ class Settings(BaseSettings):
     # gt=1 porque el recorte es mitad y mitad: con 1, content[-0:] devolvería el documento entero.
     max_summary_chars: int = Field(default=2400, gt=1)
     redis_url: str = "redis://redis:6379/0"
+    # TTL de los estados no terminales (queued/processing).
     summary_cache_ttl_seconds: int = Field(default=3600, gt=0)
+    # TTL de los estados terminales (done/failed): el resultado no debe
+    # desaparecer a la hora.
+    summary_result_ttl_seconds: int = Field(default=604800, gt=0)
     summary_cache_enabled: bool = True
     kafka_bootstrap_servers: str = "localhost:9092"
     log_level: str = "INFO"
@@ -80,25 +107,80 @@ class SummaryResponse(BaseModel):
 
 
 class SummaryJob(BaseModel):
-    """Estado y resultado del resumen, guardado como JSON en una sola clave Redis."""
+    """Estado y resultado del resumen, guardado como JSON en una sola clave Redis.
 
-    status: str
+    ``attempts`` cuenta intentos **iniciados** (se incrementa antes de inferir);
+    un crash en medio de una inferencia deja el intento contado y reconcile no
+    lo vuelve a incrementar. ``updated_at`` es ISO-8601 UTC y se usa para el
+    backoff de la ruta y para detectar jobs viejos.
+    """
+
+    status: Literal["queued", "processing", "done", "failed"]
     summary: str | None = None
+    attempts: int = 0
+    updated_at: str = LEGACY_UPDATED_AT
+    # Token saneado: type(error).__name__, empty_document o
+    # max_attempts_exhausted. Nunca el mensaje de la excepción.
+    reason: str | None = None
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_now_iso() -> str:
+    return utc_now().isoformat()
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    """Interpreta ISO-8601 o un epoch numérico; None si no se puede.
+
+    Un valor sin zona se asume UTC. Nunca se devuelve un datetime naive para
+    que la resta contra ``utc_now()`` no explote.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def build_summary_key(document_id: str) -> str:
-    return f"summary:{document_id}"
+    return f"{SUMMARY_KEY_PREFIX}{document_id}"
 
 
-def serialize_job(status: str, *, summary: str | None = None) -> str:
-    job = {"status": status}
-    if summary is not None:
-        job["summary"] = summary
-    return json.dumps(job)
+def serialize_job(
+    status: str,
+    *,
+    summary: str | None = None,
+    attempts: int = 0,
+    updated_at: str | None = None,
+    reason: str | None = None,
+) -> str:
+    job = SummaryJob(
+        status=status,
+        summary=summary,
+        attempts=attempts,
+        updated_at=updated_at or utc_now_iso(),
+        reason=reason,
+    )
+    return job.model_dump_json(exclude_none=True)
 
 
 def parse_job(raw: str | None) -> SummaryJob | None:
-    """Interpreta lo guardado en la caché; un valor corrupto se trata como miss."""
+    """Interpreta lo guardado en la caché; un valor corrupto se trata como miss.
+
+    Acepta jobs del esquema viejo (sin attempts/updated_at/reason): Pydantic
+    aplica los defaults. Un estado desconocido falla la validación y también se
+    trata como miss, para que el GET recupere desde persistence.
+    """
     if raw is None:
         return None
     try:
@@ -106,6 +188,14 @@ def parse_job(raw: str | None) -> SummaryJob | None:
     except ValueError:
         logger.warning("valor de caché inválido para un resumen; se trata como miss")
         return None
+
+
+def _reason_for(error: Exception) -> str:
+    """Token saneado para el job: nunca el mensaje (filtra URLs o contenido)."""
+    reason = getattr(error, "reason", None)
+    if isinstance(reason, str) and reason:
+        return reason[:80]
+    return type(error).__name__[:80]
 
 
 def build_prompt(content: str, max_chars: int) -> str:
@@ -154,9 +244,10 @@ def _elapsed_ms(started_at: float) -> float:
 class SummaryService:
     """Obtiene el documento, lo recorta y lo resume; deja estado y resultado en la caché.
 
-    El trigger del trabajo es el consumer de Kafka (`documents.extracted`), que
-    llama a `process`; los endpoints solo leen el estado con `peek_job` y lo
-    marcan como `queued` con `enqueue`.
+    El trigger automático del trabajo es el consumer de Kafka
+    (`documents.extracted`), que llama a `process`; los endpoints leen el
+    estado con `peek_job`, lo marcan como `queued` con `enqueue` y pueden
+    disparar el procesamiento desde un `BackgroundTask`.
     """
 
     def __init__(
@@ -167,6 +258,9 @@ class SummaryService:
         model: str,
         max_summary_chars: int,
         cache: SummaryCache | None = None,
+        *,
+        cache_ttl_seconds: int = 3600,
+        result_ttl_seconds: int = 604800,
     ) -> None:
         self._document_client = document_client
         self._persistence_url = persistence_url.rstrip("/")
@@ -174,33 +268,69 @@ class SummaryService:
         self._model = model
         self._max_summary_chars = max_summary_chars
         self._cache = cache if cache is not None else NoopSummaryCache()
+        self._cache_ttl_seconds = cache_ttl_seconds
+        self._result_ttl_seconds = result_ttl_seconds
 
     async def peek_job(self, document_id: str) -> SummaryJob | None:
         """Devuelve el job guardado en la caché (estado + resultado) o None si es miss."""
         return parse_job(await self._cache.get(build_summary_key(document_id)))
 
-    async def enqueue(self, document_id: str) -> bool:
-        """Marca el job como encolado. False = no se pudo guardar (Redis caído)."""
-        return await self._cache.set(
-            build_summary_key(document_id), serialize_job(JOB_STATE_QUEUED)
+    async def enqueue(self, document_id: str) -> EnqueueResult:
+        """Marca el job como encolado, reseteando intentos y resultado.
+
+        Nunca pisa un job ``done``: si ya hay un resultado listo devuelve
+        ``DONE`` y el llamador puede responder 200 sin reencolar.
+        ``UNAVAILABLE`` significa que no se pudo persistir el estado (Redis
+        caído o deshabilitado).
+        """
+        key = build_summary_key(document_id)
+        current = await self.peek_job(document_id)
+        if current is not None and current.status == JOB_STATE_DONE:
+            return EnqueueResult.DONE
+        saved = await self._save_job(key, JOB_STATE_QUEUED, attempts=0)
+        return EnqueueResult.QUEUED if saved else EnqueueResult.UNAVAILABLE
+
+    async def is_state_available(self) -> bool:
+        """True si Redis puede guardar el estado del job (no alcanza con leer)."""
+        return await self._cache.ping()
+
+    async def mark_failed(self, document_id: str, reason: str = MAX_ATTEMPTS_REASON) -> bool:
+        """Deja el job en ``failed`` de forma idempotente.
+
+        No pisa un ``done`` y conserva el ``reason`` real si el job ya estaba
+        ``failed`` (por ejemplo, el tercer fallo de ``process``).
+        """
+        key = build_summary_key(document_id)
+        job = await self.peek_job(document_id)
+        if job is not None and job.status == JOB_STATE_DONE:
+            return False
+        if job is not None and job.status == JOB_STATE_FAILED:
+            return True
+        attempts = job.attempts if job is not None else 0
+        return await self._save_job(
+            key, JOB_STATE_FAILED, attempts=attempts, reason=reason
         )
 
     async def process(self, document_id: str) -> bool:
         """Resumen un documento: processing → resumen → done + resultado en la caché.
 
-        Es idempotente: si el job ya está ``done`` no vuelve a inferir. El lock
-        por documento (compartido por todo el proceso) evita que el consumer y
-        el BackgroundTask del POST infieran dos veces el mismo documento.
+        Es idempotente: si el job ya está ``done`` o ``failed`` no vuelve a
+        inferir. El lock por documento (compartido por todo el proceso) evita
+        que el consumer y el BackgroundTask del POST infieran dos veces el
+        mismo documento.
 
-        Devuelve True solo si el resultado quedó guardado (o ya lo estaba); si
-        algo falla se loguea (con los tiempos medidos hasta la excepción) y
-        devuelve False (el estado queda en processing hasta que expire el TTL),
-        sin propagar: quien decide el reintento es el consumer, que confirma el
-        offset únicamente con True (at-least-once).
+        ``attempts`` cuenta intentos iniciados: se incrementa dentro del lock,
+        justo antes de escribir ``processing``. Si el proceso muere durante la
+        inferencia, el intento ya quedó contado; reconcile preserva el valor.
+
+        Devuelve True si el job quedó resuelto (``done`` o ``failed``). Un
+        fallo con intentos restantes deja el job ``queued`` y devuelve False;
+        el consumer decide el reintento (at-least-once) y la ruta lo hace tras
+        el backoff configurado.
         """
         job = await self.peek_job(document_id)
-        if job is not None and job.status == JOB_STATE_DONE:
-            logger.info("documento %s ya resumido; no se vuelve a inferir", document_id)
+        if job is not None and job.status in TERMINAL_JOB_STATES:
+            logger.info("documento %s ya resuelto (%s); no se infiere", document_id, job.status)
             return True
 
         key = build_summary_key(document_id)
@@ -210,28 +340,49 @@ class SummaryService:
                 # Re-chequeo: otro camino (consumer o background) pudo resolverlo
                 # mientras esperábamos el lock.
                 job = await self.peek_job(document_id)
-                if job is not None and job.status == JOB_STATE_DONE:
-                    logger.info("documento %s ya resumido; no se vuelve a inferir", document_id)
+                if job is not None and job.status in TERMINAL_JOB_STATES:
+                    logger.info(
+                        "documento %s ya resuelto (%s); no se infiere",
+                        document_id,
+                        job.status,
+                    )
                     return True
 
-                await self._cache.set(key, serialize_job(JOB_STATE_PROCESSING))
+                attempts = (job.attempts if job is not None else 0) + 1
+                if not await self._save_job(
+                    key, JOB_STATE_PROCESSING, attempts=attempts
+                ):
+                    # Sin estado persistido no se puede deduplicar ni recuperar:
+                    # mejor no gastar una inferencia que se va a perder.
+                    logger.warning(
+                        "no se pudo persistir el estado de %s; no se infiere", document_id
+                    )
+                    return False
+
                 timings = SummaryTimings()
                 try:
                     summary = await self._generate_summary(document_id, timings)
-                except Exception as error:
-                    # Una sola línea por job: métricas primero y traceback adjunto al
-                    # mismo record (exc_info), nunca el mensaje del error (filtra URL).
-                    logger.error(
-                        "resumen fallido document_id=%s fetch_ms=%.2f ollama_ms=%.2f "
-                        "total_ms=%.2f error=%s",
-                        document_id,
-                        timings.fetch_ms,
-                        timings.ollama_ms,
-                        timings.total_ms,
-                        type(error).__name__,
-                        exc_info=error,
+                except EmptyDocumentError as error:
+                    # Determinístico: no hay reintento que pueda mejorarlo.
+                    reason = _reason_for(error)
+                    await self._save_job(
+                        key, JOB_STATE_FAILED, attempts=attempts, reason=reason
                     )
+                    self._log_failure(document_id, timings, error)
+                    return True
+                except Exception as error:  # noqa: BLE001 - se traduce a estado del job
+                    reason = _reason_for(error)
+                    if attempts >= MAX_SUMMARY_ATTEMPTS:
+                        await self._save_job(
+                            key, JOB_STATE_FAILED, attempts=attempts, reason=reason
+                        )
+                    else:
+                        await self._save_job(
+                            key, JOB_STATE_QUEUED, attempts=attempts
+                        )
+                    self._log_failure(document_id, timings, error)
                     return False
+
                 logger.info(
                     "resumen completado document_id=%s fetch_ms=%.2f ollama_ms=%.2f total_ms=%.2f",
                     document_id,
@@ -239,11 +390,55 @@ class SummaryService:
                     timings.ollama_ms,
                     timings.total_ms,
                 )
-                return await self._cache.set(
-                    key, serialize_job(JOB_STATE_DONE, summary=summary)
+                return await self._save_job(
+                    key,
+                    JOB_STATE_DONE,
+                    summary=summary,
+                    attempts=attempts,
                 )
         finally:
             _release_lock(document_id, lock)
+
+    def _log_failure(
+        self, document_id: str, timings: SummaryTimings, error: Exception
+    ) -> None:
+        """Una sola línea por job: métricas y tipo de error, nunca el mensaje."""
+        logger.error(
+            "resumen fallido document_id=%s fetch_ms=%.2f ollama_ms=%.2f "
+            "total_ms=%.2f error=%s",
+            document_id,
+            timings.fetch_ms,
+            timings.ollama_ms,
+            timings.total_ms,
+            type(error).__name__,
+            exc_info=error,
+        )
+
+    async def _save_job(
+        self,
+        key: str,
+        status: str,
+        *,
+        summary: str | None = None,
+        attempts: int = 0,
+        reason: str | None = None,
+    ) -> bool:
+        """Escribe el job con el TTL que corresponde a su estado."""
+        ttl = (
+            self._result_ttl_seconds
+            if status in TERMINAL_JOB_STATES
+            else self._cache_ttl_seconds
+        )
+        return await self._cache.set(
+            key,
+            serialize_job(
+                status,
+                summary=summary,
+                attempts=attempts,
+                reason=reason,
+            ),
+            ttl_seconds=ttl,
+        )
 
     async def _generate_summary(self, document_id: str, timings: SummaryTimings) -> str:
         """Genera el resumen midiendo fetch y Ollama; total = la generación completa.
@@ -260,6 +455,10 @@ class SummaryService:
             finally:
                 timings.fetch_ms = _elapsed_ms(fetch_started_at)
             content = document.get("content") or ""
+            if not content.strip():
+                # Determinístico: no tiene sentido gastar una inferencia (ni
+                # reintentarla) sobre un documento vacío.
+                raise EmptyDocumentError
             prompt = build_prompt(content, self._max_summary_chars)
             ollama_started_at = time.perf_counter()
             try:
@@ -304,4 +503,6 @@ def build_summary_service(
         model=config.ollama_model,
         max_summary_chars=config.max_summary_chars,
         cache=cache,
+        cache_ttl_seconds=config.summary_cache_ttl_seconds,
+        result_ttl_seconds=config.summary_result_ttl_seconds,
     )

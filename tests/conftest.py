@@ -42,9 +42,15 @@ def build_client() -> Iterator[Callable[..., TestClient]]:
         content: str = DEFAULT_CONTENT,
         cache: FakeSummaryCache | NoopSummaryCache | None = None,
         consumer: FakeSummaryConsumer | None = None,
+        persistence_status_code: int = 200,
+        persistence_connect_error: bool = False,
     ) -> TestClient:
         fake_llm = llm_client if llm_client is not None else FakeLlmClient()
-        persistence = document_client(content)
+        persistence = document_client(
+            content,
+            status_code=persistence_status_code,
+            connect_error=persistence_connect_error,
+        )
         fake_cache = cache if cache is not None else NoopSummaryCache()
         app.dependency_overrides[get_llm_client] = lambda: fake_llm
         app.dependency_overrides[get_document_client] = lambda: persistence

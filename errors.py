@@ -30,6 +30,18 @@ class PersistenceUnavailableError(SummaryError):
     detail = "El persistence-service no está disponible"
 
 
+class EmptyDocumentError(SummaryError):
+    """El documento existe pero no tiene contenido para resumir.
+
+    Es determinístico: reintentar no puede mejorarlo, así que el job pasa a
+    ``failed`` en el primer intento con ``reason="empty_document"``.
+    """
+
+    status_code = 422
+    detail = "El documento no tiene contenido para resumir"
+    reason = "empty_document"
+
+
 class LlmError(SummaryError):
     """Fallo hablando con el proveedor de modelos."""
 
