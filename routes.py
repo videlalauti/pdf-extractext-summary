@@ -78,8 +78,9 @@ async def submit_summary(
             content={"status": job.status, "attempts": job.attempts},
         )
 
-    # Miss o failed: se reencola reseteando intentos (failed es recuperable con
-    # un POST explícito; un GET lo seguirá viendo 409 hasta entonces).
+    # Miss o failed: comprobar existencia antes de aceptar el trabajo.
+    # Un 202 sobre un documento inexistente sería un falso positivo de API.
+    await service.fetch_document(document_id)
     result = await service.enqueue(document_id)
     if result is EnqueueResult.DONE:
         job = await service.peek_job(document_id)

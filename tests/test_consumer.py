@@ -238,8 +238,25 @@ def test_un_mensaje_fallido_no_queda_confirmado_por_el_siguiente():
     assert len(llm.prompts) == 3
 
 
-def test_un_mensaje_que_falla_tres_veces_se_descarta_controladamente(caplog):
-    """Tras el tope se confirma para no atorar la partición, con log ERROR."""
+def test_commit_fallido_no_permite_avanzar_al_mensaje_siguiente():
+    """Un commit fallido obliga a reconectar en vez de confirmar offsets mayores."""
+    class KafkaConCommitFallido(FakeKafkaConsumer):
+        async def commit(self, offsets=None):
+            raise RuntimeError("broker rechazó el commit")
+
+    llm = FakeLlmClient()
+    kafka = KafkaConCommitFallido([event_message(offset=0), event_message(offset=1)])
+    consumer = build_consumer(llm=llm, kafka=kafka)
+
+    with pytest.raises(RuntimeError, match="broker rechazó"):
+        asyncio.run(consumer.process_message(event_message(offset=0)))
+
+    assert len(llm.prompts) == 1
+    assert kafka.commit_offsets == []
+
+
+def test_un_mensaje_que_falla_tres_veces_confirma_el_estado_failed(caplog):
+    """Se confirma solo después de persistir el fallo terminal."""
     llm = FakeLlmClient(error=LlmTimeoutError())
     cache = FakeSummaryCache()
     kafka = FakeKafkaConsumer([event_message("doc-1", offset=0)] * 3)
@@ -251,7 +268,6 @@ def test_un_mensaje_que_falla_tres_veces_se_descarta_controladamente(caplog):
     tp = TopicPartition(DOCUMENTS_EXTRACTED_TOPIC, 0)
     assert len(kafka.seeks) == 2
     assert kafka.commit_offsets == [{tp: 1}]
-    assert "mensaje descartado tras 3 intentos" in caplog.text
     job = json.loads(cache.data["summary:doc-1"])
     assert job["status"] == JOB_STATE_FAILED
     assert job["attempts"] == 3
@@ -290,11 +306,32 @@ def test_cache_unavailable_no_cuenta_entregas_y_usa_log_distinto(caplog):
 
     tp = TopicPartition(DOCUMENTS_EXTRACTED_TOPIC, 0)
     assert llm.prompts == []
-    assert kafka.seeks == [(tp, 0), (tp, 0)]
-    assert kafka.commit_offsets == [{tp: 1}]
+    assert kafka.seeks == [(tp, 0), (tp, 0), (tp, 0)]
+    assert kafka.commit_offsets == []
     assert "cache_unavailable" in caplog.text
-    assert "mensaje descartado tras" not in caplog.text
-    assert "mensaje descartado: cache_unavailable" in caplog.text
+    assert "mensaje retenido sin commit" in caplog.text
+
+
+def test_sin_estado_terminal_guardado_no_confirma_el_offset(caplog):
+    """Si falla guardar failed, Kafka retiene el evento para otro intento."""
+    class CacheQueFallaElEstadoFinal(FakeSummaryCache):
+        async def set(self, key, value, *, ttl_seconds=None):
+            if json.loads(value)["status"] == JOB_STATE_FAILED:
+                return False
+            return await super().set(key, value, ttl_seconds=ttl_seconds)
+
+    llm = FakeLlmClient(error=LlmTimeoutError())
+    cache = CacheQueFallaElEstadoFinal()
+    kafka = FakeKafkaConsumer([event_message("doc-1", offset=0)] * 3)
+    consumer = build_consumer(llm=llm, cache=cache, kafka=kafka)
+    caplog.set_level(logging.ERROR)
+
+    asyncio.run(_consume_all(consumer))
+
+    tp = TopicPartition(DOCUMENTS_EXTRACTED_TOPIC, 0)
+    assert kafka.commit_offsets == []
+    assert kafka.seeks == [(tp, 0), (tp, 0), (tp, 0)]
+    assert "mensaje retenido sin commit" in caplog.text
 
 
 class ToggleSummaryCache(FakeSummaryCache):

@@ -11,16 +11,17 @@ confirma **explícitamente** el offset del mensaje resuelto, con
 commits de Kafka son acumulativos, así que confirmar N+1 con N fallido marcaría
 N como consumido para siempre.
 
-Si un mensaje falla no se avanza: se reintenta con ``seek`` al mismo offset y
-backoff, hasta ``MAX_SUMMARY_ATTEMPTS``. Agotado el tope se descarta de forma
-controlada (commit explícito para liberar la partición) y se loguea en ERROR.
+Si un mensaje falla no se avanza: se reintenta con ``seek`` al mismo offset.
+Al agotar los intentos solo se confirma si el estado terminal quedó guardado;
+sin estado persistible se conserva el mensaje y se reintenta con backoff.
 Eso da semántica at-least-once: si el proceso se cae, los mensajes sin confirmar
 se reprocesan al volver, y el chequeo de idempotencia junto con el lock por
 documento hace seguro ese reenvío.
 
 Si Redis no puede guardar estado (``ping`` falso), el fallo no cuenta como una
 entrega del mensaje: se espera un intervalo fijo de 10s y se reintenta, con un
-tope de 30 esperas y un log ``cache_unavailable`` distinto. Con la caché
+contador de 30 esperas que se reinicia sin confirmar el offset. Se usa el log
+``cache_unavailable`` para distinguirlo de los errores de inferencia. Con la caché
 deshabilitada por configuración el consumer ni siquiera arranca (ver ``main``).
 """
 
@@ -282,17 +283,11 @@ class KafkaSummaryConsumer:
         return TopicPartition(message.topic, message.partition), message.offset
 
     async def _handle_failure(self, message: Any, document_id: str) -> None:
-        """Reintenta el mismo offset o lo descarta tras agotar los intentos.
+        """Reintenta el offset hasta que haya un estado terminal confirmado.
 
-        Confirmar N+1 también confirmaría N (los commits son acumulativos), así
-        que mientras N no se resuelva se hace ``seek`` a su offset. Al llegar al
-        tope se confirma explícitamente para liberar la partición.
-
-        Si Redis no puede guardar estado, el fallo no se cuenta como entrega:
-        se espera un intervalo fijo (reemplaza al backoff exponencial, no se
-        suma) y se reintenta, con tope y log ``cache_unavailable`` propio. El
-        contador se reinicia cuando ``ping`` vuelve a True o el mensaje se
-        confirma.
+        Un fallo prolongado de Redis nunca se convierte en un commit: si no se
+        pudo guardar el resultado o el error terminal, Kafka debe retener el
+        mensaje. Los contadores limitan el backoff, no la recuperación.
         """
         tp, offset = self._failure_key(message)
         key = (tp, offset)
@@ -301,17 +296,18 @@ class KafkaSummaryConsumer:
             waits = self._cache_waits.get(key, 0) + 1
             if waits >= self._max_cache_wait_attempts:
                 logger.error(
-                    "mensaje descartado: cache_unavailable document_id=%s topic=%s "
-                    "partition=%d offset=%d esperas=%d",
+                    "Redis sigue caído; mensaje retenido sin commit "
+                    "document_id=%s topic=%s partition=%d offset=%d esperas=%d",
                     document_id,
                     tp.topic,
                     tp.partition,
                     offset,
                     waits,
                 )
+                # Reiniciar solo el contador de esperas; el offset permanece pendiente.
                 self._cache_waits.pop(key, None)
-                self._failures.pop(key, None)
-                await self._commit(message)
+                await asyncio.sleep(self._cache_retry_seconds)
+                self._seek(message)
                 return
             self._cache_waits[key] = waits
             logger.warning(
@@ -334,24 +330,24 @@ class KafkaSummaryConsumer:
             job = await self._service.peek_job(document_id)
             if job is not None and job.attempts >= MAX_SUMMARY_ATTEMPTS:
                 await self._service.mark_failed(document_id)
-            else:
-                logger.warning(
-                    "tope de entregas alcanzado con attempts=%s document_id=%s; "
-                    "el job queda en su estado actual",
-                    job.attempts if job is not None else 0,
-                    document_id,
-                )
+                job = await self._service.peek_job(document_id)
+
+            self._failures.pop(key, None)
+            if job is not None and job.status in (JOB_STATE_DONE, JOB_STATE_FAILED):
+                # El resultado terminal existe en el almacén: ya se puede confirmar.
+                await self._commit(message)
+                return
+
             logger.error(
-                "mensaje descartado tras %d intentos document_id=%s topic=%s partition=%d "
-                "offset=%d",
-                attempts,
+                "sin estado terminal persistido; mensaje retenido sin commit "
+                "document_id=%s topic=%s partition=%d offset=%d",
                 document_id,
                 tp.topic,
                 tp.partition,
                 offset,
             )
-            self._failures.pop(key, None)
-            await self._commit(message)
+            await asyncio.sleep(self._message_retry_max_seconds)
+            self._seek(message)
             return
 
         self._failures[key] = attempts
@@ -377,8 +373,11 @@ class KafkaSummaryConsumer:
         try:
             await consumer.commit({tp: offset + 1})
         except Exception:
-            # No propagar: se reintenta en el próximo mensaje o al reiniciar.
-            logger.warning("no se pudo confirmar %s offset=%d", tp, offset, exc_info=True)
+            # Un commit posterior podría confirmar este mensaje de forma
+            # acumulativa. Fallar el loop fuerza al supervisor a reconectar
+            # desde el último offset confirmado por el broker.
+            logger.exception("no se pudo confirmar %s offset=%d", tp, offset)
+            raise
 
     async def stop(self) -> None:
         """Corta el loop y cierra la conexión (disposability: shutdown ordenado)."""
