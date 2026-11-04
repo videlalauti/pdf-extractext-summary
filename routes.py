@@ -7,8 +7,10 @@ from fastapi.responses import JSONResponse
 from app import (
     JOB_STATE_DONE,
     JOB_STATE_FAILED,
+    JOB_STATE_PROCESSING,
     JOB_STATE_QUEUED,
     MAX_ATTEMPTS_REASON,
+    EnqueueResult,
     Settings,
     SummaryResponse,
     SummaryService,
@@ -17,7 +19,7 @@ from app import (
 )
 from cache import SummaryCache
 from consumer import KafkaSummaryConsumer
-from errors import DocumentNotFoundError
+from errors import SummaryStateUnavailableError
 from llm import LlmClient
 
 router = APIRouter()
@@ -59,24 +61,35 @@ async def submit_summary(
     """Devuelve el resumen si ya existe; si no, acepta el trabajo con 202.
 
     El trabajo lo dispara el consumer de Kafka con el evento
-    `documents.extracted`, pero el POST también lo agenda en background: si el
-    evento se perdió (publicación fail-open, offset ya confirmado), el pedido
-    explícito del usuario no puede quedar en `queued` para siempre.
-    `BackgroundTasks` corre después de responder, así que el 202 no espera a
-    la inferencia de Ollama.
+    `documents.extracted`, pero el POST también lo agenda en background cuando
+    corresponde: si el evento se perdió (publicación fail-open, offset ya
+    confirmado), el pedido explícito del usuario no puede quedar en `queued`
+    para siempre. Un `queued` fresco no se re-dispara antes del backoff, para
+    no pisar el reintento del consumer.
     """
     job = await service.peek_job(document_id)
     if job is not None and job.status == JOB_STATE_DONE:
         return SummaryResponse(summary=job.summary or "", document_id=document_id)
-    if job is not None:
-        if job.status == JOB_STATE_QUEUED:
-            background.add_task(service.process, document_id)
+    if job is not None and job.status in (JOB_STATE_QUEUED, JOB_STATE_PROCESSING):
+        if service.should_schedule(job):
+            background.add_task(service.process, document_id, trigger="route")
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={"status": job.status, "attempts": job.attempts},
         )
-    await service.enqueue(document_id)
-    background.add_task(service.process, document_id)
+
+    # Miss o failed: se reencola reseteando intentos (failed es recuperable con
+    # un POST explícito; un GET lo seguirá viendo 409 hasta entonces).
+    result = await service.enqueue(document_id)
+    if result is EnqueueResult.DONE:
+        job = await service.peek_job(document_id)
+        return SummaryResponse(
+            summary=(job.summary if job is not None else "") or "",
+            document_id=document_id,
+        )
+    if result is EnqueueResult.UNAVAILABLE:
+        raise SummaryStateUnavailableError
+    background.add_task(service.process, document_id, trigger="route")
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content={"status": JOB_STATE_QUEUED, "attempts": 0},
@@ -85,9 +98,16 @@ async def submit_summary(
 
 @router.get("/summary/{document_id}", response_model=None)
 async def get_summary(
-    document_id: str, service: SummaryService = Depends(get_summary_service)
+    document_id: str,
+    background: BackgroundTasks,
+    service: SummaryService = Depends(get_summary_service),
 ) -> SummaryResponse | JSONResponse:
-    """Consulta el estado o resultado del resumen; 404 si nunca se pidió."""
+    """Consulta el estado o resultado; un miss de caché se recupera de persistence.
+
+    El GET no es solo lectura: si Redis no tiene el job pero el documento existe,
+    lo reencola y agenda el procesamiento. Así un Redis vacío o una clave
+    expirada no dejan al cliente con un 404 engañoso.
+    """
     job = await service.peek_job(document_id)
     if job is not None and job.status == JOB_STATE_DONE:
         return SummaryResponse(summary=job.summary or "", document_id=document_id)
@@ -103,11 +123,30 @@ async def get_summary(
             },
         )
     if job is not None:
+        if service.should_schedule(job):
+            background.add_task(service.process, document_id, trigger="route")
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={"status": job.status, "attempts": job.attempts},
         )
-    raise DocumentNotFoundError
+
+    # Miss real: distinguir documento inexistente (404) de Redis caído (503)
+    # antes de reencolar. fetch_document levanta el error de dominio adecuado.
+    await service.fetch_document(document_id)
+    result = await service.enqueue(document_id)
+    if result is EnqueueResult.DONE:
+        job = await service.peek_job(document_id)
+        return SummaryResponse(
+            summary=(job.summary if job is not None else "") or "",
+            document_id=document_id,
+        )
+    if result is EnqueueResult.UNAVAILABLE:
+        raise SummaryStateUnavailableError
+    background.add_task(service.process, document_id, trigger="route")
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"status": JOB_STATE_QUEUED, "attempts": 0},
+    )
 
 
 @router.get("/health")

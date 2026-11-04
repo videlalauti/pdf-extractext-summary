@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     # TTL de los estados terminales (done/failed): el resultado no debe
     # desaparecer a la hora.
     summary_result_ttl_seconds: int = Field(default=604800, gt=0)
+    # Un queued fresco no se reintenta desde GET/POST antes de este backoff; un
+    # processing más viejo que esto se considera huérfano y se puede reanudar.
+    summary_retry_backoff_seconds: int = Field(default=30, gt=0)
+    summary_stale_seconds: int = Field(default=600, gt=0)
     summary_cache_enabled: bool = True
     kafka_bootstrap_servers: str = "localhost:9092"
     log_level: str = "INFO"
@@ -150,6 +154,21 @@ def parse_timestamp(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _is_stale(
+    updated_at: str, threshold_seconds: int, *, now: datetime | None = None
+) -> bool:
+    """True si ``updated_at`` es inválido o tiene al menos ``threshold_seconds``.
+
+    Un timestamp inválido se trata como viejo: es preferible reanudar un job
+    dudoso que dejarlo bloqueado para siempre.
+    """
+    updated = parse_timestamp(updated_at)
+    if updated is None:
+        return True
+    reference = now or utc_now()
+    return (reference - updated).total_seconds() >= threshold_seconds
 
 
 def build_summary_key(document_id: str) -> str:
@@ -261,6 +280,8 @@ class SummaryService:
         *,
         cache_ttl_seconds: int = 3600,
         result_ttl_seconds: int = 604800,
+        retry_backoff_seconds: int = 30,
+        stale_seconds: int = 600,
     ) -> None:
         self._document_client = document_client
         self._persistence_url = persistence_url.rstrip("/")
@@ -270,6 +291,8 @@ class SummaryService:
         self._cache = cache if cache is not None else NoopSummaryCache()
         self._cache_ttl_seconds = cache_ttl_seconds
         self._result_ttl_seconds = result_ttl_seconds
+        self._retry_backoff_seconds = retry_backoff_seconds
+        self._stale_seconds = stale_seconds
 
     async def peek_job(self, document_id: str) -> SummaryJob | None:
         """Devuelve el job guardado en la caché (estado + resultado) o None si es miss."""
@@ -294,6 +317,41 @@ class SummaryService:
         """True si Redis puede guardar el estado del job (no alcanza con leer)."""
         return await self._cache.ping()
 
+    def _is_queued_stale(self, job: SummaryJob) -> bool:
+        return _is_stale(job.updated_at, self._retry_backoff_seconds)
+
+    def _is_processing_stale(self, job: SummaryJob) -> bool:
+        return _is_stale(job.updated_at, self._stale_seconds)
+
+    def should_schedule(self, job: SummaryJob) -> bool:
+        """True si GET/POST debe disparar ``process`` para este job.
+
+        - queued: recién pasado el backoff de la ruta (o si ya agotó intentos,
+          para que ``process`` lo marque failed sin inferir).
+        - processing: solo si superó ``SUMMARY_STALE_SECONDS`` (huérfano).
+        - done/failed: nunca (terminales).
+        """
+        if job.status == JOB_STATE_QUEUED:
+            # attempts == 0 es un job recién encolado: nunca se re-dispara solo
+            # por un POST/GET que lo creó. Con intentos previos, se espera el
+            # backoff; si ya agotó, se dispara para que process lo marque failed.
+            return (
+                job.attempts == 0
+                or job.attempts >= MAX_SUMMARY_ATTEMPTS
+                or self._is_queued_stale(job)
+            )
+        if job.status == JOB_STATE_PROCESSING:
+            return self._is_processing_stale(job)
+        return False
+
+    async def fetch_document(self, document_id: str) -> dict:
+        """Recupera el documento desde persistence (404/503 como errores de dominio).
+
+        Es público porque el GET lo usa para distinguir un miss de caché real
+        (documento inexistente) de un parpadeo de Redis, antes de reencolar.
+        """
+        return await self._fetch_document(document_id)
+
     async def mark_failed(self, document_id: str, reason: str = MAX_ATTEMPTS_REASON) -> bool:
         """Deja el job en ``failed`` de forma idempotente.
 
@@ -311,7 +369,9 @@ class SummaryService:
             key, JOB_STATE_FAILED, attempts=attempts, reason=reason
         )
 
-    async def process(self, document_id: str) -> bool:
+    async def process(
+        self, document_id: str, *, trigger: Literal["route", "consumer"] = "consumer"
+    ) -> bool:
         """Resumen un documento: processing → resumen → done + resultado en la caché.
 
         Es idempotente: si el job ya está ``done`` o ``failed`` no vuelve a
@@ -323,10 +383,19 @@ class SummaryService:
         justo antes de escribir ``processing``. Si el proceso muere durante la
         inferencia, el intento ya quedó contado; reconcile preserva el valor.
 
+        ``trigger`` distingue el driver:
+        - ``consumer`` (at-least-once): reintenta un ``queued`` fresco sin
+          esperar el backoff de la ruta, porque Kafka ya es el reloj del retry.
+        - ``route`` (GET/POST): no re-infiera un ``queued`` fresco con intentos
+          previos; espera ``SUMMARY_RETRY_BACKOFF_SECONDS``. Un ``processing``
+          más viejo que ``SUMMARY_STALE_SECONDS`` se trata como ``queued`` para
+          recuperar un job huérfano.
+
         Devuelve True si el job quedó resuelto (``done`` o ``failed``). Un
         fallo con intentos restantes deja el job ``queued`` y devuelve False;
         el consumer decide el reintento (at-least-once) y la ruta lo hace tras
-        el backoff configurado.
+        el backoff: si ese reintento vuelve a fallar, el siguiente GET stale
+        (pasado el backoff) lo recupera.
         """
         job = await self.peek_job(document_id)
         if job is not None and job.status in TERMINAL_JOB_STATES:
@@ -338,7 +407,9 @@ class SummaryService:
         try:
             async with lock:
                 # Re-chequeo: otro camino (consumer o background) pudo resolverlo
-                # mientras esperábamos el lock.
+                # mientras esperábamos el lock. La decisión de intento y el
+                # incremento de attempts se hacen acá adentro: dos triggers
+                # concurrentes sobre un queued stale incrementan una sola vez.
                 job = await self.peek_job(document_id)
                 if job is not None and job.status in TERMINAL_JOB_STATES:
                     logger.info(
@@ -348,7 +419,54 @@ class SummaryService:
                     )
                     return True
 
-                attempts = (job.attempts if job is not None else 0) + 1
+                attempts = job.attempts if job is not None else 0
+                if job is not None and job.status == JOB_STATE_QUEUED:
+                    if attempts >= MAX_SUMMARY_ATTEMPTS:
+                        logger.warning(
+                            "documento %s agotó los %d intentos; se marca failed sin inferir",
+                            document_id,
+                            MAX_SUMMARY_ATTEMPTS,
+                        )
+                        await self._save_job(
+                            key,
+                            JOB_STATE_FAILED,
+                            attempts=attempts,
+                            reason=MAX_ATTEMPTS_REASON,
+                        )
+                        return True
+                    if (
+                        trigger == "route"
+                        and attempts > 0
+                        and not self._is_queued_stale(job)
+                    ):
+                        logger.info(
+                            "documento %s queued hace menos de %ss; la ruta espera el backoff",
+                            document_id,
+                            self._retry_backoff_seconds,
+                        )
+                        return False
+                elif job is not None and job.status == JOB_STATE_PROCESSING:
+                    if not self._is_processing_stale(job):
+                        logger.info(
+                            "documento %s sigue processing; no se re-infere", document_id
+                        )
+                        return False
+                    # Huérfano: se trata como queued (sin incrementar dos veces).
+                    if attempts >= MAX_SUMMARY_ATTEMPTS:
+                        logger.warning(
+                            "documento %s quedó processing con %d intentos; se marca failed",
+                            document_id,
+                            attempts,
+                        )
+                        await self._save_job(
+                            key,
+                            JOB_STATE_FAILED,
+                            attempts=attempts,
+                            reason=MAX_ATTEMPTS_REASON,
+                        )
+                        return True
+
+                attempts += 1
                 if not await self._save_job(
                     key, JOB_STATE_PROCESSING, attempts=attempts
                 ):
@@ -505,4 +623,6 @@ def build_summary_service(
         cache=cache,
         cache_ttl_seconds=config.summary_cache_ttl_seconds,
         result_ttl_seconds=config.summary_result_ttl_seconds,
+        retry_backoff_seconds=config.summary_retry_backoff_seconds,
+        stale_seconds=config.summary_stale_seconds,
     )

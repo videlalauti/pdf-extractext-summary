@@ -13,6 +13,7 @@ from app import (
     JOB_STATE_PROCESSING,
     JOB_STATE_QUEUED,
     MAX_SUMMARY_ATTEMPTS,
+    EnqueueResult,
     Settings,
     build_summary_service,
     parse_job,
@@ -185,6 +186,65 @@ def test_post_con_job_processing_no_agenda_otra_inferencia(build_client):
     assert llm.prompts == []
 
 
+def test_post_con_job_queued_fresco_no_pisa_el_backoff(build_client):
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_QUEUED, attempts=1)
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.post("/summary/doc-1")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 1}
+    assert llm.prompts == []
+
+
+def test_post_con_job_queued_stale_reintenta_despues_del_backoff(build_client):
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_QUEUED,
+        attempts=1,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.post("/summary/doc-1")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 1}
+    assert len(llm.prompts) == 1
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_DONE
+    assert job.attempts == 2
+
+
+def test_post_sobre_failed_reencola_y_resetea_intentos(build_client):
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_FAILED,
+        attempts=MAX_SUMMARY_ATTEMPTS,
+        reason="LlmTimeoutError",
+    )
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.post("/summary/doc-1")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 0}
+    assert len(llm.prompts) == 1
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_DONE
+    assert job.attempts == 1
+
+
 def test_post_devuelve_200_cuando_el_resumen_ya_esta_cacheado(build_client):
     llm = FakeLlmClient()
     cache = FakeSummaryCache()
@@ -209,12 +269,21 @@ def test_post_devuelve_202_con_el_estado_actual_si_esta_en_curso(build_client):
     assert response.json() == {"status": JOB_STATE_PROCESSING, "attempts": 0}
 
 
-def test_post_responde_202_aun_con_redis_caido(build_client):
-    """Sin Redis no hay resultado cacheado: 202 y el trabajo lo hace el consumer."""
-    with build_client(llm_client=FakeLlmClient(), cache=FakeSummaryCache(fail_open=True)) as client:
+def test_post_responde_503_si_no_puede_persistir_estado(build_client):
+    """Sin estado persistible no se inicia una inferencia que no se pueda recuperar."""
+    llm = FakeLlmClient()
+
+    with build_client(llm_client=llm, cache=FakeSummaryCache(fail_open=True)) as client:
         response = client.post("/summary/doc-1")
 
-    assert response.status_code == 202
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": (
+            "El estado del resumen no está disponible (Redis caído o deshabilitado); "
+            "reintentá más tarde"
+        )
+    }
+    assert llm.prompts == []
 
 
 # --------------------------------------------------------------------------- #
@@ -265,6 +334,65 @@ def test_get_devuelve_409_con_failed_attempts_y_reason(build_client):
     }
 
 
+def test_get_queued_fresco_no_dispara_el_retry_antes_del_backoff(build_client):
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_QUEUED, attempts=1)
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.get("/summary/doc-1")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 1}
+    assert llm.prompts == []
+
+
+def test_get_queued_stale_dispara_el_retry(build_client):
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_QUEUED,
+        attempts=1,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.get("/summary/doc-1")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 1}
+    assert len(llm.prompts) == 1
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_DONE
+    assert job.attempts == 2
+
+
+def test_get_processing_stale_reanuda_el_job_huerfano(build_client):
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_PROCESSING,
+        attempts=1,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.get("/summary/doc-1")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_PROCESSING, "attempts": 1}
+    assert len(llm.prompts) == 1
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_DONE
+    assert job.attempts == 2
+
+
 def test_get_devuelve_200_tras_el_post_que_dispara_el_resumen(build_client):
     with build_client(cache=FakeSummaryCache()) as client:
         assert client.post("/summary/doc-1").status_code == 202
@@ -274,11 +402,51 @@ def test_get_devuelve_200_tras_el_post_que_dispara_el_resumen(build_client):
     assert response.json()["summary"] == "resumen de prueba"
 
 
-def test_get_sin_resumen_devuelve_404(build_client):
-    with build_client(cache=FakeSummaryCache()) as client:
+def test_get_sin_resumen_devuelve_404_si_el_documento_no_existe(build_client):
+    with build_client(
+        cache=FakeSummaryCache(), persistence_status_code=404
+    ) as client:
         response = client.get("/summary/doc-1")
 
     assert response.status_code == 404
+
+
+def test_get_sin_resumen_recupera_el_job_desde_persistence(build_client):
+    """Redis vacío no es un 404 si el documento existe: se reencola y procesa."""
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+
+    with build_client(llm_client=llm, cache=cache) as client:
+        response = client.get("/summary/doc-1")
+
+    assert response.status_code == 202
+    assert response.json() == {"status": JOB_STATE_QUEUED, "attempts": 0}
+    assert len(llm.prompts) == 1
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_DONE
+    assert job.attempts == 1
+
+
+def test_get_sin_estado_responde_503_si_redis_no_persiste(build_client):
+    llm = FakeLlmClient()
+
+    with build_client(llm_client=llm, cache=FakeSummaryCache(fail_open=True)) as client:
+        response = client.get("/summary/doc-1")
+
+    assert response.status_code == 503
+    assert "El estado del resumen no está disponible" in response.json()["detail"]
+    assert llm.prompts == []
+
+
+def test_get_sin_estado_responde_503_si_persistence_cae(build_client):
+    with build_client(
+        cache=FakeSummaryCache(), persistence_connect_error=True
+    ) as client:
+        response = client.get("/summary/doc-1")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "El persistence-service no está disponible"}
 
 
 # --------------------------------------------------------------------------- #
@@ -439,3 +607,154 @@ def test_el_reason_no_incluye_el_mensaje_del_error():
     assert job.status == JOB_STATE_FAILED
     assert job.reason == "RuntimeError"
     assert "http://" not in cache.data["summary:doc-1"]
+
+
+def test_enqueue_distingue_queued_done_y_unavailable():
+    cache = FakeSummaryCache()
+    service = _service(FakeLlmClient(), cache)
+
+    async def scenario():
+        first = await service.enqueue("doc-1")
+        cache.data["summary:doc-1"] = serialize_job(
+            JOB_STATE_DONE, summary="ya listo", attempts=1
+        )
+        second = await service.enqueue("doc-1")
+        return first, second
+
+    assert asyncio.run(scenario()) == (EnqueueResult.QUEUED, EnqueueResult.DONE)
+    unavailable = asyncio.run(
+        _service(FakeLlmClient(), FakeSummaryCache(fail_open=True)).enqueue("doc-2")
+    )
+    assert unavailable is EnqueueResult.UNAVAILABLE
+
+
+def test_process_route_no_infiere_un_queued_fresco_con_intentos():
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_QUEUED, attempts=1)
+
+    assert (
+        asyncio.run(_service(llm, cache).process("doc-1", trigger="route")) is False
+    )
+
+    assert llm.prompts == []
+    assert parse_job(cache.data["summary:doc-1"]).attempts == 1
+
+
+def test_process_consumer_si_infiere_un_queued_fresco_con_intentos():
+    """El consumer es el driver at-least-once: no le aplica el backoff de la ruta."""
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_QUEUED, attempts=1)
+
+    assert asyncio.run(_service(llm, cache).process("doc-1")) is True
+
+    assert len(llm.prompts) == 1
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_DONE
+    assert job.attempts == 2
+
+
+def test_process_no_infiere_un_processing_fresco():
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_PROCESSING, attempts=1)
+
+    service = _service(llm, cache)
+
+    assert asyncio.run(service.process("doc-1", trigger="route")) is False
+    assert asyncio.run(service.process("doc-1", trigger="consumer")) is False
+
+    assert llm.prompts == []
+    assert parse_job(cache.data["summary:doc-1"]).attempts == 1
+
+
+def test_process_trata_un_processing_stale_como_queued():
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_PROCESSING,
+        attempts=1,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+
+    assert asyncio.run(_service(llm, cache).process("doc-1", trigger="route")) is True
+
+    assert len(llm.prompts) == 1
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_DONE
+    assert job.attempts == 2
+
+
+def test_process_queued_con_attempts_max_se_marca_failed_sin_inferir():
+    llm = FakeLlmClient()
+    cache = FakeSummaryCache()
+    _seed(cache, "doc-1", JOB_STATE_QUEUED, attempts=MAX_SUMMARY_ATTEMPTS)
+
+    assert asyncio.run(_service(llm, cache).process("doc-1", trigger="route")) is True
+
+    assert llm.prompts == []
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_FAILED
+    assert job.attempts == MAX_SUMMARY_ATTEMPTS
+    assert job.reason == "max_attempts_exhausted"
+
+
+def test_dos_process_concurrentes_sobre_queued_stale_incrementan_una_vez():
+    llm = FakeLlmClient(delay=0.05)
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_QUEUED,
+        attempts=1,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+    service = _service(llm, cache)
+
+    async def scenario():
+        return await asyncio.gather(
+            service.process("doc-1", trigger="route"),
+            service.process("doc-1", trigger="route"),
+        )
+
+    assert asyncio.run(scenario()) == [True, True]
+
+    assert len(llm.prompts) == 1
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_DONE
+    assert job.attempts == 2
+
+
+def test_un_queued_que_vuelve_a_fallar_se_recupera_con_el_siguiente_get_stale():
+    """Mecanismo runtime: tras un retry fallido, el GET stale vuelve a intentar."""
+    llm = FakeLlmClient(error=LlmTimeoutError())
+    cache = FakeSummaryCache()
+    service = _service(llm, cache)
+
+    assert asyncio.run(service.process("doc-1", trigger="route")) is False
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_QUEUED
+    assert job.attempts == 1
+
+    # El GET inmediato no lo re-dispara; pasado el backoff, sí.
+    assert asyncio.run(service.process("doc-1", trigger="route")) is False
+    assert len(llm.prompts) == 1
+    cache.data["summary:doc-1"] = serialize_job(
+        JOB_STATE_QUEUED,
+        attempts=1,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+    assert asyncio.run(service.process("doc-1", trigger="route")) is False
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_QUEUED
+    assert job.attempts == 2
+    assert len(llm.prompts) == 2

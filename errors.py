@@ -26,8 +26,23 @@ class DocumentNotFoundError(SummaryError):
 class PersistenceUnavailableError(SummaryError):
     """El persistence-service no respondió o falló."""
 
-    status_code = 502
+    status_code = 503
     detail = "El persistence-service no está disponible"
+
+
+class SummaryStateUnavailableError(SummaryError):
+    """Redis no puede guardar el estado del job (caído o deshabilitado).
+
+    Sin estado persistible no se puede deduplicar ni recuperar el job, así que
+    los endpoints no inician una inferencia: es un 503 accionable, no un modo
+    degradado con resumen síncrono.
+    """
+
+    status_code = 503
+    detail = (
+        "El estado del resumen no está disponible (Redis caído o deshabilitado); "
+        "reintentá más tarde"
+    )
 
 
 class EmptyDocumentError(SummaryError):

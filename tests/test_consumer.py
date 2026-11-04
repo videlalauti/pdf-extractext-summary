@@ -297,6 +297,48 @@ def test_cache_unavailable_no_cuenta_entregas_y_usa_log_distinto(caplog):
     assert "mensaje descartado: cache_unavailable" in caplog.text
 
 
+class ToggleSummaryCache(FakeSummaryCache):
+    """Caché que simula un Redis que vuelve: get/set/ping dependen de `available`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.available = False
+
+    async def get(self, key: str) -> str | None:
+        return await super().get(key) if self.available else None
+
+    async def set(self, key: str, value: str, *, ttl_seconds: int | None = None) -> bool:
+        if not self.available:
+            return False
+        return await super().set(key, value, ttl_seconds=ttl_seconds)
+
+    async def ping(self) -> bool:
+        return self.available
+
+
+def test_el_contador_de_esperas_se_limpia_cuando_redis_vuelve():
+    llm = FakeLlmClient()
+    cache = ToggleSummaryCache()
+    kafka = FakeKafkaConsumer()
+    consumer = build_consumer(llm=llm, cache=cache, kafka=kafka)
+    message = event_message()
+    key = consumer._failure_key(message)
+
+    async def scenario():
+        await consumer.process_message(message)
+        waits_mientras_cae = dict(consumer._cache_waits)
+        cache.available = True
+        await consumer.process_message(message)
+        return waits_mientras_cae, dict(consumer._cache_waits)
+
+    waits_mientras_cae, waits_final = asyncio.run(scenario())
+
+    assert waits_mientras_cae[key] == 1
+    assert waits_final == {}
+    assert kafka.commits == 1
+    assert len(llm.prompts) == 1
+
+
 def test_documento_inexistente_no_confirma_el_offset():
     kafka = FakeKafkaConsumer([event_message("no-existe")])
     consumer = build_consumer(kafka=kafka, status_code=404)
