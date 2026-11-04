@@ -61,8 +61,13 @@ def build_client() -> Iterator[Callable[..., TestClient]]:
         return TestClient(app)
 
     original_factory = main.build_summary_consumer
+    original_redis_cache = main.RedisSummaryCache
+    # El lifespan usa su propio Redis; en tests se reemplaza por un fake para
+    # que la reconciliación al arrancar no intente conectarse a un broker real.
+    main.RedisSummaryCache = lambda *args, **kwargs: FakeSummaryCache()
     try:
         yield build
     finally:
         main.build_summary_consumer = original_factory
+        main.RedisSummaryCache = original_redis_cache
         app.dependency_overrides.clear()

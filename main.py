@@ -1,5 +1,6 @@
 """Summary service FastAPI application: bootstrap y montaje de componentes."""
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -16,7 +17,28 @@ from error_handlers import register_error_handlers
 from llm import OllamaLlmClient
 from routes import router
 
+logger = logging.getLogger(__name__)
+
 SERVICE_NAME = "summary-service"
+
+
+async def resume_reconciled_jobs(
+    summary_service: SummaryService, document_ids: list[str]
+) -> None:
+    """Reanuda los jobs reconciliados de a uno, aislando el error de cada id.
+
+    Secuencial (concurrencia 1) para no saturar Ollama con todos los jobs
+    interrumpidos al mismo tiempo. Si uno falla, se loguea y se sigue con el
+    resto; el backoff del GET cubre el reintento runtime.
+    """
+    logger.info("reanudando %d jobs reconciliados", len(document_ids))
+    for document_id in document_ids:
+        try:
+            await summary_service.process(document_id, trigger="consumer")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("fallo al reanudar el job reconciliado %s", document_id)
 
 
 def validate_runtime_settings(config: Settings) -> None:
@@ -64,10 +86,23 @@ def create_app() -> FastAPI:
         application.state.llm_client = llm_client
         application.state.summary_cache = summary_cache
         application.state.summary_consumer = consumer
+        resume_task: asyncio.Task | None = None
         try:
+            # Un processing viejo quedó interrumpido por un crash/redeploy: se
+            # reencola y se reanuda en una sola tarea secuencial.
+            reconciled = await summary_service.reconcile_stale_jobs()
+            if reconciled:
+                resume_task = asyncio.create_task(
+                    resume_reconciled_jobs(summary_service, reconciled)
+                )
             await consumer.start()
             yield
         finally:
+            if resume_task is not None:
+                resume_task.cancel()
+                # No solo cancelar: esperar a que termine (incluida la
+                # CancelledError) antes de cerrar Redis/Ollama.
+                await asyncio.gather(resume_task, return_exceptions=True)
             await consumer.stop()
             await summary_cache.aclose()
             await llm_client.aclose()

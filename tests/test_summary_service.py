@@ -496,6 +496,8 @@ def test_los_defaults_nuevos_son_los_documentados():
     config = Settings()
 
     assert config.summary_result_ttl_seconds == 604800
+    assert config.summary_retry_backoff_seconds == 30
+    assert config.summary_stale_seconds == 600
 
 
 def test_un_fallo_deja_queued_con_attempts_y_el_tercero_failed():
@@ -758,3 +760,150 @@ def test_un_queued_que_vuelve_a_fallar_se_recupera_con_el_siguiente_get_stale():
     assert job.status == JOB_STATE_QUEUED
     assert job.attempts == 2
     assert len(llm.prompts) == 2
+
+
+def test_reconcile_reencola_solo_processing_stale_y_preserva_attempts():
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "stale",
+        JOB_STATE_PROCESSING,
+        attempts=2,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+    _seed(cache, "fresh", JOB_STATE_PROCESSING, attempts=1)
+    _seed(
+        cache,
+        "queued",
+        JOB_STATE_QUEUED,
+        attempts=1,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+    _seed(
+        cache,
+        "done",
+        JOB_STATE_DONE,
+        summary="listo",
+        attempts=1,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+    service = _service(FakeLlmClient(), cache)
+
+    assert asyncio.run(service.reconcile_stale_jobs()) == ["stale"]
+
+    job = parse_job(cache.data["summary:stale"])
+    assert job is not None
+    assert job.status == JOB_STATE_QUEUED
+    assert job.attempts == 2
+    # No se infiere al reconciliar: eso lo hace la tarea de reanudación.
+    assert parse_job(cache.data["summary:fresh"]).status == JOB_STATE_PROCESSING
+    assert parse_job(cache.data["summary:queued"]).status == JOB_STATE_QUEUED
+    assert parse_job(cache.data["summary:done"]).status == JOB_STATE_DONE
+
+
+def test_reconcile_es_fail_open_si_redis_cae():
+    service = _service(FakeLlmClient(), FakeSummaryCache(fail_open=True))
+
+    assert asyncio.run(service.reconcile_stale_jobs()) == []
+
+
+def test_reconcile_preserva_attempts_max_y_el_proceso_lo_marca_failed():
+    cache = FakeSummaryCache()
+    _seed(
+        cache,
+        "doc-1",
+        JOB_STATE_PROCESSING,
+        attempts=MAX_SUMMARY_ATTEMPTS,
+        updated_at="2020-01-01T00:00:00+00:00",
+    )
+    service = _service(FakeLlmClient(), cache)
+
+    assert asyncio.run(service.reconcile_stale_jobs()) == ["doc-1"]
+    assert asyncio.run(service.process("doc-1", trigger="consumer")) is True
+
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_FAILED
+    assert job.attempts == MAX_SUMMARY_ATTEMPTS
+    assert job.reason == "max_attempts_exhausted"
+
+
+def test_resume_reconciled_jobs_es_secuencial_y_sigue_ante_un_error():
+    from main import resume_reconciled_jobs
+
+    calls: list[tuple[str, str]] = []
+
+    class RecordingService:
+        async def process(self, document_id: str, *, trigger: str) -> bool:
+            calls.append((document_id, trigger))
+            if document_id == "doc-2":
+                raise RuntimeError("falló el reanudado")
+            return True
+
+    asyncio.run(resume_reconciled_jobs(RecordingService(), ["doc-1", "doc-2", "doc-3"]))
+
+    assert calls == [
+        ("doc-1", "consumer"),
+        ("doc-2", "consumer"),
+        ("doc-3", "consumer"),
+    ]
+
+
+def test_resume_reconciled_jobs_se_puede_cancelar():
+    from main import resume_reconciled_jobs
+
+    started = asyncio.Event()
+
+    class BlockingService:
+        async def process(self, document_id: str, *, trigger: str) -> bool:
+            started.set()
+            await asyncio.Event().wait()
+            return True
+
+    async def scenario():
+        task = asyncio.create_task(
+            resume_reconciled_jobs(BlockingService(), ["doc-1"])
+        )
+        await started.wait()
+        task.cancel()
+        results = await asyncio.gather(task, return_exceptions=True)
+        return task.cancelled(), results
+
+    cancelled, results = asyncio.run(scenario())
+
+    assert cancelled is True
+    assert isinstance(results[0], asyncio.CancelledError)
+
+
+class FailingTerminalCache(FakeSummaryCache):
+    """Caché que falla solo al escribir un estado terminal ``failed``."""
+
+    async def set(self, key: str, value: str, *, ttl_seconds: int | None = None) -> bool:
+        if '"failed"' in value:
+            return False
+        return await super().set(key, value, ttl_seconds=ttl_seconds)
+
+
+def test_empty_document_no_se_reporta_resuelto_si_falla_la_escritura_terminal():
+    cache = FailingTerminalCache()
+    service = _service(FakeLlmClient(), cache, content="   ")
+
+    assert asyncio.run(service.process("doc-1")) is False
+
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_PROCESSING
+    assert job.attempts == 1
+
+
+def test_max_attempts_no_se_reporta_resuelto_si_falla_la_escritura_terminal():
+    cache = FailingTerminalCache()
+    _seed(cache, "doc-1", JOB_STATE_QUEUED, attempts=MAX_SUMMARY_ATTEMPTS)
+    service = _service(FakeLlmClient(), cache)
+
+    assert asyncio.run(service.process("doc-1", trigger="route")) is False
+
+    job = parse_job(cache.data["summary:doc-1"])
+    assert job is not None
+    assert job.status == JOB_STATE_QUEUED
+    assert job.attempts == MAX_SUMMARY_ATTEMPTS

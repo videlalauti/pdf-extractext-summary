@@ -70,6 +70,14 @@ class FakeSummaryCache:
     async def ping(self) -> bool:
         return not self.fail_open
 
+    async def scan_keys(self, prefix: str) -> list[str]:
+        if self.fail_open:
+            return []
+        return [key for key in self.data if key.startswith(prefix)]
+
+    async def aclose(self) -> None:
+        return None
+
 
 class FakeKafkaConsumer:
     """Doble de AIOKafkaConsumer: registra commits y simula fallos de arranque."""

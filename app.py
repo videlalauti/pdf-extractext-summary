@@ -369,6 +369,46 @@ class SummaryService:
             key, JOB_STATE_FAILED, attempts=attempts, reason=reason
         )
 
+    async def reconcile_stale_jobs(self) -> list[str]:
+        """Pasa a ``queued`` los ``processing`` huérfanos y devuelve sus ids.
+
+        Se corre una vez al arrancar. Un job ``processing`` más viejo que
+        ``SUMMARY_STALE_SECONDS`` se considera interrumpido (crash, redeploy):
+        se reencola preservando ``attempts`` (el intento ya se contó al escribir
+        ``processing``) y sin inferir acá. El lifespan reanuda esos ids en una
+        sola tarea secuencial, para no saturar Ollama con todos a la vez.
+
+        Fail-open: si Redis no responde, ``scan_keys`` devuelve [] y el startup
+        sigue. Asume una sola réplica: con varias, cada una reconciliaría los
+        mismos ids (el lock por documento evita la doble inferencia dentro de
+        un proceso, no entre procesos).
+        """
+        keys = await self._cache.scan_keys(SUMMARY_KEY_PREFIX)
+        reconciled: list[str] = []
+        for key in keys:
+            job = parse_job(await self._cache.get(key))
+            if (
+                job is None
+                or job.status != JOB_STATE_PROCESSING
+                or not self._is_processing_stale(job)
+            ):
+                continue
+            document_id = key.removeprefix(SUMMARY_KEY_PREFIX)
+            if not document_id:
+                continue
+            if await self._save_job(
+                key, JOB_STATE_QUEUED, attempts=job.attempts
+            ):
+                reconciled.append(document_id)
+            else:
+                logger.warning(
+                    "no se pudo reconciliar el job %s; se deja como estaba",
+                    document_id,
+                )
+        if reconciled:
+            logger.info("jobs reconciliados al arrancar: %d", len(reconciled))
+        return reconciled
+
     async def process(
         self, document_id: str, *, trigger: Literal["route", "consumer"] = "consumer"
     ) -> bool:
@@ -427,12 +467,17 @@ class SummaryService:
                             document_id,
                             MAX_SUMMARY_ATTEMPTS,
                         )
-                        await self._save_job(
+                        if not await self._save_job(
                             key,
                             JOB_STATE_FAILED,
                             attempts=attempts,
                             reason=MAX_ATTEMPTS_REASON,
-                        )
+                        ):
+                            logger.warning(
+                                "no se pudo persistir failed de %s; no se resuelve",
+                                document_id,
+                            )
+                            return False
                         return True
                     if (
                         trigger == "route"
@@ -458,12 +503,17 @@ class SummaryService:
                             document_id,
                             attempts,
                         )
-                        await self._save_job(
+                        if not await self._save_job(
                             key,
                             JOB_STATE_FAILED,
                             attempts=attempts,
                             reason=MAX_ATTEMPTS_REASON,
-                        )
+                        ):
+                            logger.warning(
+                                "no se pudo persistir failed de %s; no se resuelve",
+                                document_id,
+                            )
+                            return False
                         return True
 
                 attempts += 1
@@ -483,10 +533,16 @@ class SummaryService:
                 except EmptyDocumentError as error:
                     # Determinístico: no hay reintento que pueda mejorarlo.
                     reason = _reason_for(error)
-                    await self._save_job(
+                    saved = await self._save_job(
                         key, JOB_STATE_FAILED, attempts=attempts, reason=reason
                     )
                     self._log_failure(document_id, timings, error)
+                    if not saved:
+                        logger.warning(
+                            "no se pudo persistir failed de %s; no se resuelve",
+                            document_id,
+                        )
+                        return False
                     return True
                 except Exception as error:  # noqa: BLE001 - se traduce a estado del job
                     reason = _reason_for(error)

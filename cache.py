@@ -33,6 +33,8 @@ class SummaryCache(Protocol):
 
     async def ping(self) -> bool: ...
 
+    async def scan_keys(self, prefix: str) -> list[str]: ...
+
 
 class NoopSummaryCache:
     """Caché que no guarda nada; el flujo asíncrono no puede persistir estado.
@@ -49,6 +51,9 @@ class NoopSummaryCache:
 
     async def ping(self) -> bool:
         return False
+
+    async def scan_keys(self, prefix: str) -> list[str]:
+        return []
 
 
 class RedisSummaryCache:
@@ -106,6 +111,23 @@ class RedisSummaryCache:
         except (RedisError, OSError) as exc:
             logger.warning("Redis no disponible al hacer ping: %s", exc)
             return False
+
+    async def scan_keys(self, prefix: str) -> list[str]:
+        """Claves que empiezan con ``prefix`` (para reconciliar al arrancar).
+
+        Fail-open: ante un error devuelve [] y el startup sigue; el consumer
+        mantiene su guard de caché para los mensajes.
+        """
+        if not self._enabled:
+            return []
+        try:
+            keys: list[str] = []
+            async for key in self._client.scan_iter(match=f"{prefix}*"):
+                keys.append(key.decode("utf-8") if isinstance(key, bytes) else str(key))
+            return keys
+        except (RedisError, OSError) as exc:
+            logger.warning("Redis no disponible al escanear %s: %s", prefix, exc)
+            return []
 
     async def aclose(self) -> None:
         if self._owns_client:
