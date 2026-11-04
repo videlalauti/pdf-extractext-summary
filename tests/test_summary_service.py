@@ -138,6 +138,15 @@ def test_cache_deshabilitada_falla_el_startup():
 # --------------------------------------------------------------------------- #
 
 
+def test_post_documento_inexistente_devuelve_404_y_no_encola(build_client):
+    cache = FakeSummaryCache()
+    with build_client(cache=cache, persistence_status_code=404) as client:
+        response = client.post("/summary/no-existe")
+
+    assert response.status_code == 404
+    assert cache.sets == []
+
+
 def test_post_responde_202_queued_cuando_no_hay_resumen(build_client):
     with build_client(llm_client=FakeLlmClient(), cache=FakeSummaryCache()) as client:
         response = client.post("/summary/doc-1")
