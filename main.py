@@ -12,6 +12,7 @@ from shared.web.logging import RequestIdMiddleware, TimingMiddleware, setup_logg
 
 from app import Settings, SummaryService, build_summary_service, settings
 from cache import RedisSummaryCache
+from consul_runtime import ConsulRuntime
 from consumer import KafkaSummaryConsumer
 from error_handlers import register_error_handlers
 from llm import OllamaLlmClient
@@ -64,6 +65,14 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         validate_runtime_settings(settings)
+        registry = ConsulRuntime(SERVICE_NAME)
+        await registry.start()
+        if registry.enabled:
+            cfg = registry.config
+            await registry.resolve(cfg["persistence_service"])
+            gateway = await registry.resolve(cfg["gateway_service"])
+            settings.persistence_service_url = gateway + "/persistence"
+            settings.ollama_url = gateway + "/ollama"
         document_client = httpx.AsyncClient(timeout=settings.persistence_timeout_seconds)
         llm_client = OllamaLlmClient(
             base_url=settings.ollama_url, timeout=settings.ollama_timeout_seconds
@@ -107,6 +116,7 @@ def create_app() -> FastAPI:
             await summary_cache.aclose()
             await llm_client.aclose()
             await document_client.aclose()
+            await registry.stop()
 
     application = FastAPI(title="PDF Summary Service", version="1.0.0", lifespan=lifespan)
     # Timing se registra antes de RequestId (en Starlette el último queda más

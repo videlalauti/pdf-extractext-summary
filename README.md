@@ -71,7 +71,7 @@ mismo trabajo en `BackgroundTasks` cuando corresponde, como red de seguridad.
 | `queued` | `202` | `202` | `{"status": "queued", "attempts": N}` (sin `document_id`) |
 | `processing` | `202` | `202` | `{"status": "processing", "attempts": N}` (sin `document_id`) |
 | `failed` | `409` | `202` (reencola) | `GET`: `{"status": "failed", "attempts": N, "reason": "..."}` |
-| sin estado y documento inexistente | `404` | `202` (el job falla en background; luego `409`) | — |
+| sin estado y documento inexistente | `404` | `404` (comprueba que exista antes de encolar) | — |
 | sin estado persistible | `503` | `503` | `{"detail": "El estado del resumen no está disponible (...); reintentá más tarde"}` |
 
 - **`200` solo significa resumen listo**: un `failed` responde `409` (con `reason` y `attempts`) para
@@ -163,7 +163,7 @@ opcionales si no se quieren pisar.
 
 | Situación | Respuesta |
 | --- | --- |
-| Documento inexistente | `GET`: `404` si persistence tampoco lo tiene. `POST`: `202` y el job falla en background (`reason="DocumentNotFoundError"`); luego `GET` responde `409` |
+| Documento inexistente | `GET` y `POST`: `404` si Persistence tampoco lo tiene; no se encola un job inexistente |
 | Redis caído o deshabilitado | `503` con `{"detail": ...}` en `POST`/`GET`; no se inicia una inferencia sin estado persistible |
 | Job `failed` (3 intentos o documento vacío) | `409` con `status`, `attempts` y `reason`; un `POST` explícito lo reencola |
 | Broker de Kafka caído | El servicio levanta igual y reintenta solo con backoff; `POST` sigue pudiendo disparar el resumen |
@@ -220,3 +220,33 @@ El paquete `pdf-extractext-shared` se instala desde el tag, no desde PyPI:
 ```
 pip install "pdf-extractext-shared @ https://github.com/videlalauti/pdf-extractext-shared/archive/refs/tags/v1.3.0.zip"
 ```
+
+
+## Guion de arquitectura y health (defensa)
+
+**Capas:**
+- **Presentación:** `routes.py`, estados HTTP 202 pendiente / 200 listo /
+  409 fallido / 404 documento inexistente / 503 dependencia no disponible.
+- **Aplicación:** `app.py` (`SummaryService`) consulta el documento, recorta
+  el prompt, organiza intentos y persiste el estado del trabajo.
+- **Infraestructura:** `consumer.py` (Kafka con offsets manuales),
+  `cache.py` (Redis) y `llm.py` (adaptador Ollama HTTP).
+- **Bootstrap:** `main.py` inicia consumer, reconcilia jobs viejos y cierra
+  clientes Redis, Ollama, Kafka y HTTP al apagar.
+
+**No es un 200 decorativo:** `GET /health` verifica Ollama, estado de conexion
+del consumidor de Kafka y ping a Redis; responde 503 si cualquier dependencia
+no esta lista. Los tests `tests/test_readiness.py` prueban la diferencia.
+
+**Circuit Breaker de proxy:** cuando se ejecuta con la nueva version de Infra,
+`PERSISTENCE_SERVICE_URL` y `OLLAMA_URL` apuntan al entrypoint privado
+`reverse-proxy:8081`. Traefik gestiona el cortocircuito HTTP de esos destinos;
+este servicio sigue manejando estados y reintentos. Kafka no es HTTP y no pasa
+por ese breaker.
+
+**Demostracion automatica:** en Infra ejecutar
+`python scripts/dev.py upload --unique --wait-summary`, o manualmente
+`POST /upload` en Extraction y `GET /summary/{id}` en Swagger de Summary;
+no hacer `POST /summary/{id}` antes del GET si se quiere probar que **Kafka
+dispara el trabajo automaticamente**. El resultado generado se guarda en Redis,
+no en la colección `documents` de MongoDB.
