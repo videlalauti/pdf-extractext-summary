@@ -36,9 +36,11 @@ def test_disabled_without_consul_environment():
 
 
 def test_enabled_requires_acl_token():
-    with patch.dict("os.environ", {"CONSUL_HTTP_ADDR": "http://consul:8500"}, clear=True):
-        with pytest.raises(ConsulUnavailableError, match="CONSUL_APP_TOKEN"):
-            ConsulRuntime("validation-service")
+    with (
+        patch.dict("os.environ", {"CONSUL_HTTP_ADDR": "http://consul:8500"}, clear=True),
+        pytest.raises(ConsulUnavailableError, match="CONSUL_APP_TOKEN"),
+    ):
+        ConsulRuntime("validation-service")
 
 
 def test_register_reads_kv_sets_http_health_and_tags():
@@ -87,31 +89,39 @@ def test_resolve_uses_node_address_when_no_service_address():
 
 def test_resolution_without_healthy_instance_fails():
     client = runtime()
-    with patch.object(client, "_request", return_value=[]):
-        with pytest.raises(ConsulUnavailableError, match="no encuentra"):
-            asyncio.run(client.resolve("missing", attempts=1))
+    with (
+        patch.object(client, "_request", return_value=[]),
+        pytest.raises(ConsulUnavailableError, match="no encuentra"),
+    ):
+        asyncio.run(client.resolve("missing", attempts=1))
 
 
 def test_config_must_match_own_service():
     client = runtime()
-    with patch.object(client, "_request", return_value=config_payload(role="other")):
-        with pytest.raises(ConsulUnavailableError, match="incorrecta"):
-            asyncio.run(client.load_config())
+    with (
+        patch.object(client, "_request", return_value=config_payload(role="other")),
+        pytest.raises(ConsulUnavailableError, match="incorrecta"),
+    ):
+        asyncio.run(client.load_config())
 
 
 def test_config_rejects_empty_and_missing_items():
     client = runtime()
     for records in ([], [{"Value": None}]):
-        with patch.object(client, "_request", return_value=records):
-            with pytest.raises(ConsulUnavailableError):
-                asyncio.run(client.load_config())
+        with (
+            patch.object(client, "_request", return_value=records),
+            pytest.raises(ConsulUnavailableError),
+        ):
+            asyncio.run(client.load_config())
 
 
 def test_register_fails_closed_if_kv_unavailable():
     client = runtime()
-    with patch.object(client, "_request", side_effect=ConsulUnavailableError("offline")):
-        with pytest.raises(ConsulUnavailableError):
-            asyncio.run(client.start())
+    with (
+        patch.object(client, "_request", side_effect=ConsulUnavailableError("offline")),
+        pytest.raises(ConsulUnavailableError),
+    ):
+        asyncio.run(client.start())
     assert not client.registered
 
 
@@ -125,9 +135,11 @@ def test_shutdown_continues_if_consul_disconnected():
 
 def test_http_api_wraps_network_error():
     client = runtime()
-    with patch("consul_runtime.urlopen", side_effect=URLError("offline")):
-        with pytest.raises(ConsulUnavailableError, match="Consul no disponible"):
-            client._request("GET", "/v1/kv/test")
+    with (
+        patch("consul_runtime.urlopen", side_effect=URLError("offline")),
+        pytest.raises(ConsulUnavailableError, match="Consul no disponible"),
+    ):
+        client._request("GET", "/v1/kv/test")
 
 
 def test_http_api_sends_token_without_logging_secret():
