@@ -14,7 +14,7 @@ RUN ln -sf /usr/local/bin/python /usr/bin/python \
 FROM gcr.io/distroless/python3-debian13:nonroot@sha256:64e54c4b1200da244d80181d98e86fc01d73c8101f107d5baf472152d8e119a2
 WORKDIR /app
 COPY --from=deps /opt/venv /opt/venv
-COPY main.py app.py routes.py cache.py consumer.py errors.py error_handlers.py llm.py entrypoint.py ./
+COPY main.py app.py routes.py cache.py consumer.py errors.py error_handlers.py llm.py entrypoint.py consul_runtime.py ./
 ENV PATH="/opt/venv/bin:$PATH"
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
