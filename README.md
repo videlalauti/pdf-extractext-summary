@@ -71,7 +71,7 @@ mismo trabajo en `BackgroundTasks` cuando corresponde, como red de seguridad.
 | `queued` | `202` | `202` | `{"status": "queued", "attempts": N}` (sin `document_id`) |
 | `processing` | `202` | `202` | `{"status": "processing", "attempts": N}` (sin `document_id`) |
 | `failed` | `409` | `202` (reencola) | `GET`: `{"status": "failed", "attempts": N, "reason": "..."}` |
-| sin estado y documento inexistente | `404` | `202` (el job falla en background; luego `409`) | — |
+| sin estado y documento inexistente | `404` | `404` (comprueba que exista antes de encolar) | — |
 | sin estado persistible | `503` | `503` | `{"detail": "El estado del resumen no está disponible (...); reintentá más tarde"}` |
 
 - **`200` solo significa resumen listo**: un `failed` responde `409` (con `reason` y `attempts`) para
