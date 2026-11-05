@@ -163,7 +163,7 @@ opcionales si no se quieren pisar.
 
 | Situación | Respuesta |
 | --- | --- |
-| Documento inexistente | `GET`: `404` si persistence tampoco lo tiene. `POST`: `202` y el job falla en background (`reason="DocumentNotFoundError"`); luego `GET` responde `409` |
+| Documento inexistente | `GET` y `POST`: `404` si Persistence tampoco lo tiene; no se encola un job inexistente |
 | Redis caído o deshabilitado | `503` con `{"detail": ...}` en `POST`/`GET`; no se inicia una inferencia sin estado persistible |
 | Job `failed` (3 intentos o documento vacío) | `409` con `status`, `attempts` y `reason`; un `POST` explícito lo reencola |
 | Broker de Kafka caído | El servicio levanta igual y reintenta solo con backoff; `POST` sigue pudiendo disparar el resumen |
